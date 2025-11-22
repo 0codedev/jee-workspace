@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: backups
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required) - The user ID of the owner.
+    //   - data: string (required) - The JSON stringified backup data.
+    //   - updatedAt: string (required) - The time the backup was last updated.
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    // Check if the user is authenticated
+    function isAuthenticated() {
+       return request.auth != null;
+    }
+    
+    // Check if user owns the resource (for user-owned documents)
+    function isOwner(userId) {
+       return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Check if user is owner based on document's uid field
+    function isDocOwner() {
+       return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+    
+    // Verify UID hasn't been tampered with on create
+    function uidUnchanged() {
+       return !('uid' in request.resource.data) ||
+         request.resource.data.uid == request.auth.uid;
+    }
+    
+    // Ensure uid field is not modified on update
+    function uidNotModified() {
+       return !('uid' in request.resource.data) ||
+         request.resource.data.uid == resource.data.uid;
+    }
+    
+    // Validate required fields exist
+    function hasRequiredFields(fields) {
+       return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate ISO 8601 date string format (YYYY-MM-DDTHH:MM:SS)
+    function isValidDateString(dateStr) {
+      return dateStr is string &&
+        dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    // Validate that the document contains only the allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Domain Validators
+    function isValidBackup(data) {
+      return (hasOnlyAllowedFields(['uid', 'data', 'updatedAt']) || hasOnlyAllowedFields(['uid', 'totalChunks', 'updatedAt'])) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 100 &&
+             (!('data' in data) || (data.data is string && data.data.size() < 1000000)) &&
+             (!('totalChunks' in data) || (data.totalChunks is number && data.totalChunks > 0 && data.totalChunks < 100)) &&
+             isValidDateString(data.updatedAt);
+    }
+
+    function isValidChunk(data) {
+      return hasOnlyAllowedFields(['index', 'data']) &&
+             data.index is number && data.index >= 0 &&
+             data.data is string && data.data.size() < 1000000;
+    }
+
+    match /backups/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidBackup(request.resource.data) && uidUnchanged();
+      allow update: if isOwner(userId) && isValidBackup(request.resource.data) && uidNotModified();
+      allow delete: if isOwner(userId);
+      
+      match /chunks/{chunkId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isValidChunk(request.resource.data);
+      }
+    }
+
+    // Cohort Anonymous Benchmarks
+    match /cohort_snapshots/{userId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    match /cohort_benchmarks/{docId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // Shared Flashcard Decks
+    match /shared_decks/{shareCode} {
+      allow read: if true;
+      allow write: if true;
+    }
+  }
+}
