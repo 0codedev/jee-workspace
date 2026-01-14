@@ -1,0 +1,185 @@
+
+import React, { useRef, useState } from 'react';
+import { Download, Loader2 } from 'lucide-react';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
+import 'katex/dist/katex.min.css';
+
+interface MarkdownRendererProps {
+    content: string;
+    className?: string;
+    baseTextSize?: string;
+    baseTextColor?: string;
+    showExport?: boolean;
+    title?: string;
+}
+
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS = [rehypeRaw, rehypeKatex];
+
+const MARKDOWN_COMPONENTS = {
+    h1: ({node, ...props}: any) => (
+        <h1 className="text-xl md:text-2xl font-bold text-white bg-gradient-to-r from-indigo-900/80 to-slate-900/80 border-l-4 border-indigo-500 p-4 rounded-r-xl mb-8 shadow-lg shadow-indigo-500/10 tracking-tight" {...props} />
+    ),
+    h2: ({node, ...props}: any) => (
+        <h2 className="text-lg md:text-xl font-bold text-indigo-300 bg-slate-800/50 border border-slate-700/50 px-4 py-2.5 rounded-lg mt-10 mb-5 flex items-center gap-3 shadow-sm w-full" {...props} />
+    ),
+    h3: ({node, ...props}: any) => (
+        <h3 className="text-base md:text-lg font-bold text-cyan-400 mt-8 mb-3 flex items-center gap-2" {...props} />
+    ),
+    p: ({node, ...props}: any) => <p className="mb-5 leading-relaxed text-slate-300 opacity-95" {...props} />,
+    hr: ({node, ...props}: any) => <hr className="my-8 border-slate-700/50" {...props} />,
+    div: ({node, ...props}: any) => <div {...props} />,
+    footer: ({node, ...props}: any) => <footer {...props} />,
+    ul: ({node, ...props}: any) => <ul className="space-y-4 my-6" {...props} />,
+    ol: ({node, ...props}: any) => <ol className="list-decimal space-y-4 my-6 pl-8 text-indigo-400 font-bold" {...props} />,
+    li: ({node, ordered, ...props}: any) => {
+        if (ordered) {
+            return <li className="pl-2 text-slate-300 font-normal" {...props} />;
+        }
+        return (
+            <li className="bg-slate-800/30 border border-slate-700/30 p-4 rounded-xl flex gap-4 transition-colors hover:bg-slate-800/50 hover:border-slate-600/50 group/li">
+                <div className="mt-1.5 shrink-0 w-2 h-2 bg-cyan-500 rounded-full shadow-[0_0_10px_rgba(6,182,212,0.6)]"></div>
+                <div className="leading-relaxed text-slate-200">{props.children}</div>
+            </li>
+        );
+    },
+    strong: ({node, ...props}: any) => <strong className="text-indigo-200 font-bold" {...props} />,
+    blockquote: ({node, ...props}: any) => (
+        <div className="my-8 p-5 bg-indigo-500/5 border border-indigo-500/20 rounded-2xl relative overflow-hidden group/quote">
+            <div className="absolute top-0 left-0 w-1 h-full bg-indigo-500"></div>
+            <div className="flex items-center gap-2 mb-2 text-indigo-400 font-bold text-xs uppercase tracking-widest">
+                <span className="text-base">💡</span>
+                <span>Strategic Insight</span>
+            </div>
+            <blockquote className="italic text-indigo-100/90 leading-relaxed" {...props} />
+        </div>
+    ),
+    table: ({node, ...props}: any) => (
+        <div className="overflow-x-auto my-8 rounded-xl border border-slate-700/50 shadow-xl">
+            <table className="min-w-full text-sm text-left border-collapse" {...props} />
+        </div>
+    ),
+    thead: ({node, ...props}: any) => <thead className="bg-slate-800 text-slate-200 font-bold uppercase tracking-wider text-xs" {...props} />,
+    th: ({node, ...props}: any) => <th className="px-4 py-3 border-b border-slate-700 whitespace-nowrap bg-slate-800/80" {...props} />,
+    td: ({node, ...props}: any) => <td className="px-4 py-2 border-r border-slate-700/30 last:border-r-0 bg-slate-900/20" {...props} />,
+    code: ({node, inline, ...props}: any) => (
+        inline ? 
+        <code className="bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded text-xs font-mono border border-slate-700 shadow-sm" {...props} /> :
+        <code className="block bg-slate-900 text-emerald-400 p-4 rounded-lg border border-slate-800 font-mono text-sm my-4 overflow-x-auto" {...props} />
+    )
+};
+
+export const MarkdownRenderer: React.FC<MarkdownRendererProps> = React.memo(({ 
+    content, 
+    className = '',
+    baseTextSize = 'text-sm md:text-base',
+    baseTextColor = 'text-slate-300',
+    showExport = true,
+    title = 'AI_Response'
+}) => {
+    const contentRef = useRef<HTMLDivElement>(null);
+    const [isExporting, setIsExporting] = useState(false);
+
+    if (!content) return null;
+
+    const handleDownloadPdf = async () => {
+        if (!contentRef.current) return;
+        setIsExporting(true);
+
+        try {
+            const element = contentRef.current;
+            
+            // Create a temporary container for printing to ensure good styling
+            const printContainer = document.createElement('div');
+            printContainer.style.position = 'fixed';
+            printContainer.style.left = '-9999px';
+            printContainer.style.top = '0';
+            printContainer.style.width = '800px'; // Standard A4 width-ish
+            printContainer.style.padding = '40px';
+            printContainer.style.backgroundColor = '#0f172a'; // Match app background
+            printContainer.style.color = '#cbd5e1';
+            printContainer.style.fontFamily = 'sans-serif';
+            
+            // Clone the content
+            const clone = element.cloneNode(true) as HTMLElement;
+            
+            // Remove the download button from the clone if it exists
+            const downloadBtn = clone.querySelector('.pdf-export-btn');
+            if (downloadBtn) downloadBtn.remove();
+            
+            // Add a header to the PDF
+            const header = document.createElement('div');
+            header.innerHTML = `
+                <div style="border-bottom: 2px solid #334155; margin-bottom: 20px; padding-bottom: 10px;">
+                    <h1 style="color: #38bdf8; margin: 0; font-size: 24px;">${title.replace(/_/g, ' ')}</h1>
+                    <p style="color: #94a3b8; margin: 5px 0 0; font-size: 12px;">Generated by AI Assistant on ${new Date().toLocaleString()}</p>
+                </div>
+            `;
+            printContainer.appendChild(header);
+            printContainer.appendChild(clone);
+            document.body.appendChild(printContainer);
+
+            const canvas = await html2canvas(printContainer, {
+                scale: 2,
+                useCORS: true,
+                backgroundColor: '#0f172a',
+                logging: false,
+            });
+
+            const imgData = canvas.toDataURL('image/png');
+            const pdf = new jsPDF({
+                orientation: 'portrait',
+                unit: 'px',
+                format: [canvas.width / 2, canvas.height / 2]
+            });
+
+            const imgProps = pdf.getImageProperties(imgData);
+            const pdfWidth = pdf.internal.pageSize.getWidth();
+            const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
+
+            pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
+            pdf.save(`${title.replace(/\s+/g, '_')}_${new Date().getTime()}.pdf`);
+
+            document.body.removeChild(printContainer);
+        } catch (error) {
+            console.error('PDF Export failed:', error);
+        } finally {
+            setIsExporting(false);
+        }
+    };
+
+    return (
+        <div className={`relative group/md ${className}`}>
+            {showExport && (
+                <button
+                    onClick={handleDownloadPdf}
+                    disabled={isExporting}
+                    className="pdf-export-btn absolute -top-2 -right-2 p-1.5 bg-slate-800/80 hover:bg-cyan-600 text-slate-400 hover:text-white rounded-md border border-slate-700 shadow-lg transition-colors opacity-0 group-hover/md:opacity-100 z-10 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider"
+                    title="Download as PDF"
+                >
+                    {isExporting ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                        <Download className="w-3 h-3" />
+                    )}
+                    <span>PDF</span>
+                </button>
+            )}
+            <div ref={contentRef} className={`font-sans ${baseTextColor} ${baseTextSize}`}>
+                <Markdown
+                    remarkPlugins={REMARK_PLUGINS}
+                    rehypePlugins={REHYPE_PLUGINS}
+                    components={MARKDOWN_COMPONENTS}
+                >
+                    {content}
+                </Markdown>
+            </div>
+        </div>
+    );
+});
