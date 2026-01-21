@@ -1,0 +1,626 @@
+
+import React, { useState, useEffect, useRef } from 'react';
+import { motion } from 'framer-motion';
+import type { View, GlobalFilter, UserProfile, Toast } from '../../types';
+import { GlobalFilterBar } from '../GlobalFilterBar';
+import { Button } from '../common/Button';
+import { ToastContainer } from '../common/Toast';
+import { GlobalHelpDrawer } from '../common/GlobalHelpDrawer';
+import { useJeeStore } from '../../store/useJeeStore';
+
+interface AppShellProps {
+    view: View;
+    setView: (view: View) => void;
+    userProfile: UserProfile;
+    globalFilter: GlobalFilter;
+    setGlobalFilter: (filter: GlobalFilter) => void;
+    availableTestTypes: string[];
+    availableSubTypes: string[];
+    toasts: Toast[];
+    setToasts: React.Dispatch<React.SetStateAction<Toast[]>>;
+    children: React.ReactNode;
+}
+
+const NavItem = React.memo<{
+    viewId: View;
+    label: string;
+    currentView: View;
+    setView: (view: View) => void;
+    children: React.ReactNode;
+    onClick?: () => void;
+    isSidebarCollapsed?: boolean;
+}>(({ viewId, label, currentView, setView, children, onClick, isSidebarCollapsed }) => {
+    const isActive = viewId === currentView;
+    return (
+        <div className={`w-full py-0.5 ${isSidebarCollapsed ? 'px-2' : 'px-3'}`}>
+            <button
+                onClick={() => { setView(viewId); if (onClick) onClick(); }}
+                title={label}
+                aria-label={label}
+                aria-current={isActive ? 'page' : undefined}
+                className={`group relative w-full h-10 flex items-center ${isSidebarCollapsed ? 'justify-center' : 'gap-3 px-3'} rounded-lg transition-all duration-200 ${
+                    isActive 
+                        ? 'bg-slate-800/90 border-l-2 border-cyan-400 shadow-md shadow-cyan-950/20' 
+                        : 'hover:bg-slate-800/50 border-l-2 border-transparent'
+                }`}
+            >
+                <div className={`transition-colors shrink-0 ${isActive ? 'text-cyan-400 scale-110' : 'text-slate-400 group-hover:text-slate-200'}`}>
+                    {children}
+                </div>
+                {!isSidebarCollapsed && (
+                    <span className={`text-sm font-medium transition-colors whitespace-nowrap ${isActive ? 'text-white font-semibold' : 'text-slate-400 group-hover:text-slate-200'}`}>
+                        {label}
+                    </span>
+                )}
+            </button>
+        </div>
+    );
+});
+
+interface NavItemData {
+    id: string;
+    label: string;
+    icon: React.ReactNode;
+}
+
+interface NavGroupData {
+    title: string;
+    icon: React.ReactNode;
+    items: NavItemData[];
+}
+
+const NavGroup = React.memo<{
+    group: NavGroupData;
+    isSidebarCollapsed: boolean;
+    currentView: View;
+    setView: (view: View) => void;
+    onItemClick?: () => void;
+}>(({ group, isSidebarCollapsed, currentView, setView, onItemClick }) => {
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
+    const hasActiveItem = group.items.some(i => i.id === currentView);
+    const [isHovered, setIsHovered] = useState(false);
+    const [isPinned, setIsPinned] = useState(isMobile || hasActiveItem);
+
+    const isExpanded = isMobile || isPinned || isHovered || hasActiveItem;
+
+    return (
+        <div 
+            className="w-full flex flex-col mb-4"
+            onMouseEnter={() => setIsHovered(true)}
+            onMouseLeave={() => setIsHovered(false)}
+        >
+            <div 
+                className={`flex items-center ${isSidebarCollapsed ? 'justify-center px-2' : 'px-5'} py-2 cursor-pointer transition-colors hover:text-white ${isPinned ? 'text-white' : 'text-gray-500'}`}
+                onClick={() => setIsPinned(!isPinned)}
+                title={isSidebarCollapsed ? group.title : undefined}
+            >
+                <div className={`flex items-center ${isSidebarCollapsed ? 'justify-center' : 'gap-3'} w-full relative group/tooltip`}>
+                    <div className="shrink-0">
+                        {group.icon}
+                    </div>
+                    {isSidebarCollapsed && (
+                        <div className="absolute left-full top-1/2 -translate-y-1/2 ml-3 px-2.5 py-1 bg-slate-800 border border-slate-700 text-white text-xs rounded-lg whitespace-nowrap opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl font-medium">
+                            {group.title}
+                        </div>
+                    )}
+                    {!isSidebarCollapsed && (
+                        <span className="text-xs font-semibold tracking-wider uppercase whitespace-nowrap">
+                            {group.title}
+                        </span>
+                    )}
+                </div>
+            </div>
+            
+            <div 
+                className={`grid transition-[grid-template-rows,opacity] duration-300 ease-in-out ${isExpanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}
+            >
+                <div className="overflow-hidden flex flex-col gap-y-1 mt-1">
+                    {group.items.map((item) => (
+                        <NavItem 
+                            key={item.id} 
+                            viewId={item.id as View} 
+                            label={item.label} 
+                            currentView={currentView} 
+                            setView={setView} 
+                            onClick={onItemClick}
+                            isSidebarCollapsed={isSidebarCollapsed}
+                        >
+                            {item.icon}
+                        </NavItem>
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+});
+
+const navGroups = [
+    {
+        title: 'Core Prep',
+        icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>,
+        items: [
+            { id: 'daily-planner', label: 'Daily Planner', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg> },
+            { id: 'dashboard', label: 'Dashboard', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" /></svg> },
+            { id: 'syllabus', label: 'Syllabus', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.246 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg> },
+        ]
+    },
+    {
+        title: 'Logs',
+        icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>,
+        items: [
+            { id: 'data-entry', label: 'Add Report', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> },
+            { id: 'question-log-editor', label: 'Question Logs', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg> },
+        ]
+    },
+    {
+        title: 'Analytics',
+        icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" /><path strokeLinecap="round" strokeLinejoin="round" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" /></svg>,
+        items: [
+            { id: 'detailed-reports', label: 'Reports', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg> },
+            { id: 'efficiency-optimizer', label: 'Time Optimizer', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> },
+            { id: 'pyq-lab', label: 'PYQ Intelligence', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9.879 16.121A3 3 0 1012.015 11L11 14H9c0 .768.293 1.536.879 2.121z" /></svg> },
+            { id: 'rank-predictor', label: 'Rank & Colleges', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" /></svg> },
+            { id: 'weak-zone-radar', label: 'Weak Zone Radar', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg> },
+            { id: 'root-cause', label: 'Root Cause', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg> },
+            { id: 'deep-analysis', label: 'Deep Analysis', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> },
+        ]
+    },
+    {
+        title: 'AI Coach',
+        icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 3v2m6-2v2M4 9a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H6a2 2 0 01-2-2V9z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 13h.01M15 13h.01M9 17h6" /></svg>,
+        items: [
+            { id: 'ai-assistant', label: 'AI Coach', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg> },
+            { id: 'new-ai-features', label: 'New AI Features', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> },
+        ]
+    },
+    {
+        title: 'Study Tools',
+        icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 13.255A23.931 23.931 0 0112 15c-3.183 0-6.22-.62-9-1.745M16 6V4a2 2 0 00-2-2h-4a2 2 0 00-2 2v2m4 6h.01M5 20h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>,
+        items: [
+            { id: 'flashcards', label: 'Error Vaccinator', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg> },
+            { id: 'formula-vault', label: 'Formula Vault', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg> },
+            { id: 'exam-day-center', label: 'Exam Day Center', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2zm9-13.5V9" /></svg> },
+            { id: 'burnout-dashboard', label: 'Burnout & Energy', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> },
+            { id: 'launchpad', label: 'Launchpad', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.5 14.5l-3-3a22 22 0 012-3.95A12.88 12.88 0 0122 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 01-4 2z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 12H4s.55-3.03 2-5c1.62-2.2 5-3 5-3" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 15v5s.8 3.38 3 5c2.2 1.62 5 2 5 2" /><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 00-2.91-.09z" /></svg> },
+            { id: 'reflections', label: 'Reflections', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M16 3H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12l5-5V5a2 2 0 0 0-2-2z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15 21V16a1 1 0 0 1 1-1h5" /></svg> },
+            { id: 'achievements', label: 'Awards', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg> },
+        ]
+    }
+];
+
+const bottomItems = [
+    { id: 'settings', label: 'Settings', icon: <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 sidebar-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg> },
+];
+
+const CommandPalette: React.FC<{ 
+    isOpen: boolean; 
+    onClose: () => void; 
+    setView: (view: View) => void; 
+}> = ({ isOpen, onClose, setView }) => {
+    const [query, setQuery] = useState('');
+    const [selectedIndex, setSelectedIndex] = useState(0);
+    const inputRef = React.useRef<HTMLInputElement>(null);
+
+    const COMMAND_ICONS: Record<string, string> = {
+        'daily-planner': '📅',
+        'dashboard': '🏠',
+        'rank-predictor': '🎯',
+        'efficiency-optimizer': '⚡',
+        'exam-day-center': '🚩',
+        'pyq-lab': '🔥',
+        'weak-zone-radar': '📡',
+        'formula-vault': '📐',
+        'burnout-dashboard': '🔋',
+        'root-cause': '🔍',
+        'flashcards': '💉',
+        'add-report': '➕',
+        'ai-chat': '🤖',
+        'reflections': '📓',
+        'launchpad': '🚀',
+    };
+
+    const commands = [
+        { id: 'daily-planner', label: 'Go to Daily Planner', category: 'Navigation', action: () => setView('daily-planner') },
+        { id: 'dashboard', label: 'Go to Dashboard', category: 'Navigation', action: () => setView('dashboard') },
+        { id: 'exam-day-center', label: 'Go to Exam Day Command Center', category: 'Navigation', action: () => setView('exam-day-center') },
+        { id: 'rank-predictor', label: 'Open Rank & College Predictor', category: 'Analytics', action: () => setView('rank-predictor') },
+        { id: 'efficiency-optimizer', label: 'Open Time-Per-Mark Optimizer', category: 'Analytics', action: () => setView('efficiency-optimizer') },
+        { id: 'pyq-lab', label: 'Open PYQ Intelligence Lab', category: 'Analytics', action: () => setView('pyq-lab') },
+        { id: 'weak-zone-radar', label: 'Open Weak Zone & Retention Radar', category: 'Analytics', action: () => setView('weak-zone-radar') },
+        { id: 'formula-vault', label: 'Open Formula & Concept Vault', category: 'Study', action: () => setView('formula-vault') },
+        { id: 'burnout-dashboard', label: 'Check Burnout & Cognitive Battery', category: 'Wellbeing', action: () => setView('burnout-dashboard') },
+        { id: 'root-cause', label: 'Analyze Root Causes', category: 'Analysis', action: () => setView('root-cause') },
+        { id: 'flashcards', label: 'Review Error Vaccinator', category: 'Study', action: () => setView('flashcards') },
+        { id: 'add-report', label: 'Add New Test Report', category: 'Action', action: () => setView('data-entry') },
+        { id: 'ai-chat', label: 'Ask AI Coach', category: 'Action', action: () => setView('ai-assistant') },
+        { id: 'reflections', label: 'View Reflections', category: 'Study', action: () => setView('reflections') },
+        { id: 'launchpad', label: 'Open Launchpad', category: 'Navigation', action: () => setView('launchpad') },
+    ];
+
+    const filteredCommands = commands.filter(c => c.label.toLowerCase().includes(query.toLowerCase()));
+
+    useEffect(() => {
+        if (isOpen) {
+            inputRef.current?.focus();
+            setSelectedIndex(0);
+        }
+    }, [isOpen]);
+
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (!isOpen) return;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSelectedIndex(prev => (prev + 1) % filteredCommands.length);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSelectedIndex(prev => (prev - 1 + filteredCommands.length) % filteredCommands.length);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (filteredCommands[selectedIndex]) {
+                    filteredCommands[selectedIndex].action();
+                    onClose();
+                }
+            } else if (e.key === 'Escape') {
+                onClose();
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [isOpen, filteredCommands, selectedIndex, onClose]);
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/60 backdrop-blur-sm" onClick={onClose}>
+            <div className="w-full max-w-2xl glass-panel border border-slate-700 rounded-2xl shadow-2xl overflow-hidden animate-scale-in" onClick={e => e.stopPropagation()}>
+                <div className="flex items-center border-b border-slate-800 px-4">
+                    <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                    <input
+                        ref={inputRef}
+                        className="w-full bg-transparent border-none py-4 px-3 text-gray-200 focus:outline-none text-lg placeholder-gray-600"
+                        placeholder="Type a command or search..."
+                        aria-label="Search commands"
+                        value={query}
+                        onChange={e => setQuery(e.target.value)}
+                    />
+                </div>
+                <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
+                    {filteredCommands.length > 0 ? (
+                        <ul className="py-2">
+                            {filteredCommands.map((cmd, index) => (
+                                <li
+                                    key={cmd.id}
+                                    className={`px-4 py-3 flex justify-between items-center cursor-pointer ${index === selectedIndex ? 'bg-[rgb(var(--color-primary-rgb))] text-white' : 'text-gray-300 hover:bg-slate-800'}`}
+                                    onClick={() => { cmd.action(); onClose(); }}
+                                    onMouseEnter={() => setSelectedIndex(index)}
+                                >
+                                    <span className="flex items-center gap-2.5">
+                                        <span className="text-base">{COMMAND_ICONS[cmd.id] ?? '•'}</span>
+                                        <span className="font-medium text-sm">{cmd.label}</span>
+                                    </span>
+                                    <span className={`text-xs opacity-60 font-mono ${index === selectedIndex ? 'text-white' : 'text-gray-500'}`}>{cmd.category}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <div className="px-4 py-6 text-center text-gray-500">No results found.</div>
+                    )}
+                </div>
+                <div className="bg-slate-800/50 px-4 py-2 text-xs text-gray-500 border-t border-slate-800 flex justify-between">
+                    <span><kbd className="bg-slate-700 px-1.5 py-0.5 rounded">↑↓</kbd> to navigate</span>
+                    <span><kbd className="bg-slate-700 px-1.5 py-0.5 rounded">↵</kbd> to select</span>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export const AppShell: React.FC<AppShellProps> = ({ view, setView, userProfile, globalFilter, setGlobalFilter, availableTestTypes, availableSubTypes, toasts, setToasts, children }) => {
+    const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+    const [isHelpDrawerOpen, setIsHelpDrawerOpen] = useState(false);
+    const [isHeaderVisible, setIsHeaderVisible] = useState(true);
+    const mainRef = useRef<HTMLElement>(null);
+
+    const appearancePreferences = useJeeStore(state => state.appearancePreferences);
+
+    // Inertial production-grade auto-hiding header (smooth reveal on scroll-up anywhere, hide on scroll-down)
+    useEffect(() => {
+        if (view === 'ai-assistant') return; // AI Assistant controls header visibility via ai-chat-header-toggle
+        const mainEl = mainRef.current;
+        if (!mainEl) return;
+
+        let lastScroll = mainEl.scrollTop;
+        let accumulated = 0;
+        let rafId: number | null = null;
+
+        const onScroll = () => {
+            if (rafId !== null) return;
+
+            rafId = window.requestAnimationFrame(() => {
+                const currentScroll = mainEl.scrollTop;
+                const delta = currentScroll - lastScroll;
+                const clientHeight = mainEl.clientHeight;
+                const scrollHeight = mainEl.scrollHeight;
+
+                // 1. Top guard: always visible near top, ignore iOS rubber-band negative bounce
+                if (currentScroll <= 15) {
+                    setIsHeaderVisible(true);
+                    accumulated = 0;
+                    lastScroll = Math.max(0, currentScroll);
+                    rafId = null;
+                    return;
+                }
+
+                // 2. Bottom guard: ignore rubber-band bounce when hitting the end of the page
+                if (currentScroll + clientHeight >= scrollHeight - 20) {
+                    rafId = null;
+                    return;
+                }
+
+                // 3. Direction reversal detection: if user flipped direction, reset accumulated delta immediately
+                if ((delta > 0 && accumulated < 0) || (delta < 0 && accumulated > 0)) {
+                    accumulated = 0;
+                }
+
+                accumulated += delta;
+
+                // 4. Threshold triggers
+                if (accumulated > 15 && currentScroll > 64) {
+                    // Scrolling down past threshold -> smoothly hide header
+                    setIsHeaderVisible(false);
+                    accumulated = 0;
+                } else if (accumulated < -8) {
+                    // Scrolling up anywhere on page -> immediately and smoothly reveal header
+                    setIsHeaderVisible(true);
+                    accumulated = 0;
+                }
+
+                lastScroll = currentScroll;
+                rafId = null;
+            });
+        };
+
+        mainEl.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('scroll', onScroll, { passive: true });
+
+        return () => {
+            mainEl.removeEventListener('scroll', onScroll);
+            window.removeEventListener('scroll', onScroll);
+            if (rafId !== null) window.cancelAnimationFrame(rafId);
+        };
+    }, [view]);
+
+    // Reset header to visible and scroll to top upon view navigation
+    useEffect(() => {
+        setIsHeaderVisible(true);
+        if (mainRef.current) {
+            mainRef.current.scrollTop = 0;
+        }
+    }, [view]);
+
+    // Listen for AI chat scroll toggle to auto-hide global filter header on chat scroll
+    useEffect(() => {
+        const handleAiChatHeaderToggle = (e: Event) => {
+            const detail = (e as CustomEvent).detail;
+            if (typeof detail?.hide === 'boolean') {
+                setIsHeaderVisible(!detail.hide);
+            }
+        };
+        window.addEventListener('ai-chat-header-toggle', handleAiChatHeaderToggle);
+        return () => window.removeEventListener('ai-chat-header-toggle', handleAiChatHeaderToggle);
+    }, []);
+
+    const headerVisible = isSidebarOpen || isPaletteOpen || isHelpDrawerOpen || isHeaderVisible;
+
+    useEffect(() => {
+        if (appearancePreferences?.liteMode) {
+            document.body.classList.add('lite-mode');
+        } else {
+            document.body.classList.remove('lite-mode');
+        }
+    }, [appearancePreferences?.liteMode]);
+
+    useEffect(() => {
+        const TAB_SHORTCUTS: Record<string, View> = {
+            '1': 'dashboard',
+            '2': 'syllabus',
+            '3': 'daily-planner',
+            '4': 'question-log-editor',
+            '5': 'detailed-reports',
+            '6': 'root-cause',
+            '7': 'ai-assistant',
+            '8': 'flashcards',
+            '9': 'reflections',
+            '0': 'settings'
+        };
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            const activeTag = document.activeElement?.tagName;
+            const isInputFocused = activeTag === 'INPUT' || activeTag === 'TEXTAREA' || document.activeElement?.getAttribute('contenteditable') === 'true';
+
+            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                e.preventDefault();
+                setIsPaletteOpen(prev => !prev);
+                return;
+            }
+
+            if (e.altKey && !isInputFocused && TAB_SHORTCUTS[e.key]) {
+                e.preventDefault();
+                setView(TAB_SHORTCUTS[e.key]);
+            }
+        };
+        document.addEventListener('keydown', handleKeyDown);
+        return () => document.removeEventListener('keydown', handleKeyDown);
+    }, [setView]);
+
+    // First-launch auto-open after 3s (desktop only to prevent intrusive mobile takeover)
+    useEffect(() => {
+        const hasSeenHelp = localStorage.getItem('help_panel_seen');
+        const isMobileScreen = typeof window !== 'undefined' && window.innerWidth < 768;
+        if (!hasSeenHelp && !isMobileScreen) {
+            const timer = setTimeout(() => {
+                setIsHelpDrawerOpen(true);
+            }, 3000);
+            return () => clearTimeout(timer);
+        }
+    }, []);
+
+    const dynamicNavGroups = navGroups;
+    const dynamicBottomItems = bottomItems;
+
+    return (
+        <div className="relative z-10 flex h-full w-full bg-slate-900 overflow-x-hidden">
+            <ToastContainer toasts={toasts} setToasts={setToasts} />
+            <CommandPalette isOpen={isPaletteOpen} onClose={() => setIsPaletteOpen(false)} setView={setView} />
+            <GlobalHelpDrawer isOpen={isHelpDrawerOpen} onClose={() => setIsHelpDrawerOpen(false)} onNavigateView={setView} />
+            
+            {/* Mobile Sidebar Overlay */}
+            {isSidebarOpen && (
+                <div 
+                    className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 md:hidden"
+                    onClick={() => setIsSidebarOpen(false)}
+                />
+            )}
+
+            {/* Sidebar */}
+            <aside className={`
+                fixed md:static inset-y-0 left-0 z-50 glass-panel border-r border-slate-800 flex flex-col py-4
+                transform transition-all duration-300 ease-in-out md:transform-none
+                ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+                ${isSidebarCollapsed ? 'w-20' : 'w-56'}
+            `}>
+                <div className={`flex items-center ${isSidebarCollapsed ? 'justify-center' : 'gap-3 px-5'} mb-8 shrink-0 transition-all duration-300`}>
+                    <div 
+                        className="w-8 h-8 bg-slate-800/50 border border-slate-700 rounded-lg flex items-center justify-center text-cyan-400 font-bold text-lg shadow-lg cursor-pointer hover:bg-slate-700 transition-colors shrink-0"
+                        onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+                        title="Toggle Sidebar"
+                    >
+                        J
+                    </div>
+                    {!isSidebarCollapsed && (
+                        <span className="text-white font-semibold tracking-wide whitespace-nowrap overflow-hidden">JEE Analytics</span>
+                    )}
+                </div>
+                
+                <nav aria-label="Main Navigation" className="flex-grow flex flex-col gap-y-2 w-full overflow-y-auto hide-scrollbar">
+                    {dynamicNavGroups.map((group, groupIdx) => (
+                        <NavGroup 
+                            key={groupIdx} 
+                            group={group} 
+                            isSidebarCollapsed={isSidebarCollapsed} 
+                            currentView={view} 
+                            setView={setView} 
+                            onItemClick={() => setIsSidebarOpen(false)} 
+                        />
+                    ))}
+                </nav>
+
+                <div className="mt-auto pt-4 w-full flex flex-col border-t border-white/10">
+                    {dynamicBottomItems.map(item => (
+                         <NavItem 
+                            key={item.id} 
+                            viewId={item.id as View} 
+                            label={item.label} 
+                            currentView={view} 
+                            setView={setView} 
+                            onClick={() => setIsSidebarOpen(false)}
+                            isSidebarCollapsed={isSidebarCollapsed}
+                        >
+                            {item.icon}
+                        </NavItem>
+                    ))}
+                </div>
+            </aside>
+            
+            <div className="flex-1 flex flex-col overflow-hidden relative">
+                <header className={`
+                    absolute top-0 left-0 right-0 h-16 glass-panel border-b border-slate-800 
+                    flex items-center px-4 z-30 justify-between overflow-visible
+                    transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]
+                    ${headerVisible ? 'translate-y-0 opacity-100 pointer-events-auto shadow-md' : '-translate-y-full opacity-0 pointer-events-none shadow-none'}
+                `}>
+                    {/* Mobile Menu Button */}
+                    <button 
+                        className="md:hidden text-gray-400 hover:text-white p-2 -ml-2"
+                        onClick={() => setIsSidebarOpen(true)}
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                        </svg>
+                    </button>
+
+                    {/* Centered Filter Bar */}
+                    <div className="flex-1 flex justify-center px-2 overflow-visible md:overflow-visible hide-scrollbar z-50">
+                        <GlobalFilterBar filter={globalFilter} setFilter={setGlobalFilter} testTypes={availableTestTypes} subTypes={availableSubTypes} />
+                    </div>
+                    
+                    {/* Right Actions */}
+                    <div className="flex items-center gap-3 ml-2 flex-shrink-0">
+                        <button 
+                            className="hidden md:flex items-center gap-1 text-slate-400 hover:text-white p-2 rounded-lg hover:bg-slate-800 transition-colors"
+                            onClick={() => setIsPaletteOpen(true)}
+                            title="Search (Ctrl+K)"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                            </svg>
+                            <kbd className="flex items-center text-[10px] text-slate-400 font-mono px-1.5 py-0.5 bg-slate-800/80 border border-slate-700 rounded">Ctrl+K</kbd>
+                        </button>
+                        <button 
+                            className="md:hidden text-slate-400 hover:text-white p-2 rounded-full hover:bg-slate-800 transition-colors"
+                            onClick={() => setIsPaletteOpen(true)}
+                            title="Search"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                            </svg>
+                        </button>
+                        
+                        {/* Circular Help "?" Button */}
+                        <button
+                            onClick={() => setIsHelpDrawerOpen(true)}
+                            title="Help -- How to use JEE War Room"
+                            className="relative w-8 h-8 rounded-full bg-cyan-950/80 hover:bg-cyan-900 border border-cyan-500/50 hover:border-cyan-400 text-cyan-400 hover:text-white font-bold text-sm flex items-center justify-center transition-all shadow-md shadow-cyan-950/40 group hover:ring-2 hover:ring-cyan-400/50"
+                        >
+                            <span className="group-hover:scale-110 transition-transform">?</span>
+                        </button>
+
+                        <div className="h-6 w-[1px] bg-slate-800 mx-1"></div>
+
+                        <div className="flex items-center gap-2">
+                            <span className="hidden md:block text-sm font-medium text-slate-300 max-w-[100px] truncate text-right">
+                                {userProfile.name || 'Student'}
+                            </span>
+                            <div
+                                className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0"
+                                style={{
+                                    background: 'linear-gradient(135deg, rgba(var(--accent-rgb),0.22) 0%, rgba(var(--accent-rgb),0.06) 100%)',
+                                    border: '1.5px solid rgba(var(--accent-rgb), 0.4)',
+                                    color: 'var(--accent-text)',
+                                    boxShadow: '0 0 10px rgba(var(--accent-rgb), 0.15)',
+                                }}
+                            >
+                                {(userProfile.name || 'S').charAt(0).toUpperCase()}
+                            </div>
+                        </div>
+                    </div>
+                </header>
+
+                <main 
+                    ref={mainRef} 
+                    id="main-content" 
+                    className={`flex-1 overflow-x-hidden bg-transparent focus:outline-none transition-[padding] duration-300 ${
+                        view === 'ai-assistant' 
+                            ? `overflow-hidden flex flex-col h-full ${headerVisible ? 'pt-16' : 'pt-0'} p-0` 
+                            : 'overflow-y-auto px-4 md:px-6 pb-6 pt-20 md:pt-[5.5rem]'
+                    }`}
+                >
+                    {children}
+                </main>
+            </div>
+        </div>
+    );
+};
