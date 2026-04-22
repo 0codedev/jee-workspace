@@ -1,0 +1,1767 @@
+
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import type { StudyGoal, QuestionLog, DailyTask, UserProfile } from '../types';
+import { TaskType, SyllabusStatus, TaskEffort } from '../types';
+import { getDailyQuote, generateEndOfDaySummary, generateTasksFromGoal, generateSmartTasks, generateSmartTaskOrder } from '../services/geminiService';
+import { JEE_SYLLABUS } from '../constants';
+import { JeeState, JeeActions } from '../store/useJeeStore';
+import Modal from './common/Modal';
+import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { audioEngine, playTTS } from '../services/audioEngine';
+import { formatDateFull, formatDuration } from '../utils/formatters';
+import { useAppStore } from '../store/useAppStore';
+
+import { MarkdownRenderer } from './common/MarkdownRenderer';
+import { getISTDateString, evaluateStreakOnCompletion, getActiveStreakCount } from '../utils/streakEngine';
+import { RangeSlider } from './common/RangeSlider';
+import { computeCognitiveLoadScore } from '../services/burnoutEngine';
+import {
+    EISENHOWER_QUADRANTS,
+    EisenhowerQuadrant,
+    sortTasksByPriority,
+    classifyEisenhowerQuadrant,
+    autoSlotTasks,
+    computeWorkloadCapacity,
+    generateWeakZoneTasks,
+    generateFormulaReviewTask,
+    generateErrorVaccineTask,
+    splitTaskIntoSprints
+} from '../services/plannerAlgorithm';
+
+interface DailyPlannerProps {
+  goals: StudyGoal[];
+  setGoals: React.Dispatch<React.SetStateAction<StudyGoal[]>>;
+  apiKey: string;
+  logs: QuestionLog[];
+  proactiveInsight: { subject: 'physics' | 'chemistry' | 'maths'; visible: boolean; } | null;
+  onAcceptPlan: () => void;
+  onDismissInsight: () => void;
+  addXp: (event: 'completeTask') => void;
+  userProfile: UserProfile;
+  prefilledTask: Partial<DailyTask> | null;
+  setPrefilledTask: (task: Partial<DailyTask> | null) => void;
+  tasks?: DailyTask[];
+  onUpdateTasks?: React.Dispatch<React.SetStateAction<DailyTask[]>>;
+  modelName?: string;
+  bioStats: JeeState['bioStats'];
+  setBioStats: JeeActions['setBioStats'];
+  dailyQuote: JeeState['dailyQuote'];
+  setDailyQuote: JeeActions['setDailyQuote'];
+  streakData: JeeState['streakData'];
+  setStreakData: JeeActions['setStreakData'];
+  endOfDaySummaries: JeeState['endOfDaySummaries'];
+  setEndOfDaySummaries: JeeActions['setEndOfDaySummaries'];
+  dailyPlansHistory: JeeState['dailyPlansHistory'];
+  setDailyPlansHistory: JeeActions['setDailyPlansHistory'];
+}
+
+// --- NEW COMPONENT: Morning Readiness Widget ---
+const MorningReadinessWidget: React.FC<{
+    onSave: (data: { sleep: number; stress: number; energy: number }) => void;
+    onSkip: () => void;
+    onSnooze: () => void;
+}> = ({ onSave, onSkip, onSnooze }) => {
+    const [sleep, setSleep] = useState(7);
+    const [stress, setStress] = useState(5);
+    const [energy, setEnergy] = useState(7);
+
+    return (
+        <div className="glass-panel rounded-2xl p-6 mb-8 animate-fade-in shadow-lg">
+            <div className="flex justify-between items-center mb-6">
+                <div>
+                    <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                        <span className="text-xl">🌿</span> Morning Readiness
+                    </h3>
+                    <p className="text-slate-400 text-sm mt-1">Calibrate your day. Honesty maximizes efficiency.</p>
+                </div>
+                <button onClick={onSnooze} className="text-slate-500 hover:text-slate-300 text-sm font-medium transition-colors">
+                    Snooze
+                </button>
+            </div>
+            
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                {/* Sleep */}
+                <div>
+                    <RangeSlider
+                        label="🌙 Sleep Duration"
+                        min={3}
+                        max={12}
+                        step={0.5}
+                        unit="h"
+                        value={sleep}
+                        accentColor="cyan"
+                        onChange={setSleep}
+                    />
+                </div>
+
+                {/* Stress */}
+                <div>
+                    <RangeSlider
+                        label="🤯 Stress Level"
+                        min={1}
+                        max={10}
+                        step={1}
+                        unit="/10"
+                        value={stress}
+                        accentColor="rose"
+                        onChange={setStress}
+                    />
+                </div>
+
+                {/* Energy */}
+                <div>
+                    <RangeSlider
+                        label="⚡ Energy Level"
+                        min={1}
+                        max={10}
+                        step={1}
+                        unit="/10"
+                        value={energy}
+                        accentColor="amber"
+                        onChange={setEnergy}
+                    />
+                </div>
+            </div>
+            
+            <div className="flex justify-end items-center gap-3 mt-8 pt-6 border-t border-white/10">
+                <button onClick={onSkip} className="text-slate-400 hover:text-white px-4 py-2 text-sm transition-colors">
+                    Skip for Today
+                </button>
+                <button onClick={() => onSave({ sleep, stress, energy })} className="bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-6 rounded-lg shadow-sm text-sm transition-colors">
+                    Sync & Plan
+                </button>
+            </div>
+        </div>
+    );
+};
+
+// --- NEW COMPONENT: Morning Readiness Summary Widget ---
+const MorningReadinessSummaryWidget: React.FC<{ stats: { sleep: number; stress: number; energy: number } }> = ({ stats }) => {
+    return (
+        <div className="glass-panel p-6 rounded-2xl shadow-lg">
+            <h3 className="text-lg font-bold text-cyan-300 mb-4 text-center flex items-center justify-center gap-2">
+                <span className="text-xl">🌿</span> Morning Readiness
+            </h3>
+            <div className="grid grid-cols-3 gap-2">
+                <div className="glass-panel p-3 rounded-xl text-center flex flex-col items-center justify-center">
+                    <div className="text-2xl mb-1">🌙</div>
+                    <div className="text-xs text-gray-400 uppercase tracking-wider font-bold">Sleep</div>
+                    <div className="text-lg font-bold text-white mt-1">{stats.sleep}h</div>
+                </div>
+                <div className="glass-panel p-3 rounded-xl text-center flex flex-col items-center justify-center">
+                    <div className="text-2xl mb-1">🤯</div>
+                    <div className="text-xs text-gray-400 uppercase tracking-wider font-bold">Stress</div>
+                    <div className="text-lg font-bold text-white mt-1">{stats.stress}/10</div>
+                </div>
+                <div className="glass-panel p-3 rounded-xl text-center flex flex-col items-center justify-center">
+                    <div className="text-2xl mb-1">⚡️</div>
+                    <div className="text-xs text-gray-400 uppercase tracking-wider font-bold">Energy</div>
+                    <div className="text-lg font-bold text-white mt-1">{stats.energy}/10</div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const taskTypeConfig: Record<TaskType, { name: string, color: string, icon: string }> = {
+    [TaskType.StudySession]: { name: "Study Session", color: "border-l-blue-400", icon: "📚" },
+    [TaskType.ProblemPractice]: { name: "Problem Practice", color: "border-l-green-400", icon: "✍️" },
+    [TaskType.Revision]: { name: "Revision", color: "border-l-yellow-400", icon: "🔄" },
+    [TaskType.MockTest]: { name: "Mock Test", color: "border-l-red-400", icon: "⏱️" },
+    [TaskType.Break]: { name: "Break", color: "border-l-indigo-400", icon: "☕" },
+};
+
+const effortConfig: Record<TaskEffort, { label: string, icon: string, color: string }> = {
+    [TaskEffort.Low]: { label: "Low", icon: "😌", color: "bg-green-900/30 text-green-300 border-green-700" },
+    [TaskEffort.Medium]: { label: "Medium", icon: "🙂", color: "bg-yellow-900/30 text-yellow-300 border-yellow-700" },
+    [TaskEffort.High]: { label: "High", icon: "🥵", color: "bg-red-900/30 text-red-300 border-red-700" },
+};
+
+const FocusAnalyticsWidget: React.FC<{ logs: QuestionLog[] }> = ({ logs }) => {
+    const [heatmapData, setHeatmapData] = useState<{ hour: string; count: number }[]>([]);
+
+    useEffect(() => {
+        const counts = new Array(24).fill(0);
+        logs.forEach(log => {
+            if (log.timestamp) {
+                const hour = new Date(log.timestamp).getHours();
+                counts[hour]++;
+            }
+        });
+
+        const data = [];
+        for (let i = 6; i <= 23; i++) {
+            data.push({ hour: `${i}:00`, count: counts[i] });
+        }
+        setHeatmapData(data);
+    }, [logs]);
+
+    return (
+        <div className="glass-panel p-4 rounded-2xl">
+            <h4 className="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
+                <span className="text-lg">🔥</span> Focus Heatmap (Best Hours)
+            </h4>
+            <div className="h-32">
+                <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={heatmapData}>
+                        <XAxis dataKey="hour" tick={{ fontSize: 10 }} stroke="#64748b" interval={2} />
+                        <Tooltip 
+                            contentStyle={{ backgroundColor: 'rgba(30, 41, 59, 0.9)', borderColor: 'rgba(148, 163, 184, 0.2)', borderRadius: '0.5rem', fontSize: '12px', backdropFilter: 'blur(8px)' }}
+                            cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                        />
+                        <Bar dataKey="count" radius={[2, 2, 0, 0]}>
+                            {heatmapData.map((entry, index) => (
+                                <Cell key={`cell-${index}`} fill={entry.count > 4 ? '#fbbf24' : '#38bdf8'} />
+                            ))}
+                        </Bar>
+                    </BarChart>
+                </ResponsiveContainer>
+            </div>
+        </div>
+    );
+};
+
+const AccomplishmentModal: React.FC<{ task: DailyTask; onSave: (id: string, accomplishment: string) => void; onClose: () => void; interruptionCount: number }> = ({ task, onSave, onClose, interruptionCount }) => {
+    const [accomplishment, setAccomplishment] = useState('');
+    const inputRef = useRef<HTMLInputElement>(null);
+
+    useEffect(() => { if (inputRef.current) inputRef.current.focus(); }, []);
+
+    const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); onSave(task.id, accomplishment); };
+
+    return (
+        <Modal isOpen={true} onClose={onClose} title="Task Completed!">
+            <form onSubmit={handleSubmit} className="space-y-4">
+                <p className="text-gray-300">Great job completing: <strong className="text-white">{task.text}</strong></p>
+                {interruptionCount > 3 && (
+                    <div className="bg-red-900/20 border border-red-800 p-3 rounded text-xs text-red-300">
+                        <strong>⚠️ Context Switching Detected:</strong> You paused {interruptionCount} times. This task will be flagged as "Fragmented Focus".
+                    </div>
+                )}
+                <div>
+                    <label htmlFor="accomplishment-input" className="block text-sm text-gray-400 mb-1">What did you accomplish?</label>
+                    <input id="accomplishment-input" ref={inputRef} type="text" value={accomplishment} onChange={(e) => setAccomplishment(e.target.value)} placeholder="e.g. Solved 15 PYQs from Rotational Motion" className="w-full p-2 glass-panel rounded-md focus:ring-2 focus:ring-cyan-500 focus:outline-none text-white" />
+                </div>
+                <div className="flex justify-end gap-2">
+                    <button type="button" onClick={onClose} className="px-4 py-2 text-gray-400 hover:text-white">Skip</button>
+                    <button type="submit" className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-md font-bold">Save & Celebrate</button>
+                </div>
+            </form>
+        </Modal>
+    );
+};
+
+const TimeBlockSchedule: React.FC<{ tasks: DailyTask[]; onDropTask: (taskId: string, hour: number) => void; onRemoveTask: (taskId: string) => void; userProfile: UserProfile }> = ({ tasks, onDropTask, onRemoveTask, userProfile }) => {
+    const { startHour, endHour } = useMemo(() => {
+        let minH = 24, maxH = 0;
+        const parseTime = (timeStr: string) => {
+            const match = timeStr.match(/(\d+)(?::(\d+))?\s*(AM|PM)?/i);
+            if (!match) return null;
+            let h = parseInt(match[1], 10);
+            const ampm = match[3]?.toUpperCase();
+            if (ampm === 'PM' && h < 12) h += 12;
+            if (ampm === 'AM' && h === 12) h = 0;
+            return h;
+        };
+        Object.values(userProfile.studyTimes).forEach((tVal) => {
+            const parts = String(tVal).split('-').map(s => s.trim());
+            if (parts.length > 0) {
+                const start = parseTime(parts[0]);
+                if (start !== null) { minH = Math.min(minH, start); maxH = Math.max(maxH, start + 3); }
+                if (parts.length > 1) { const end = parseTime(parts[1]); if (end !== null) maxH = Math.max(maxH, end); }
+            }
+        });
+        if (minH === 24) minH = 7; if (maxH === 0) maxH = 22;
+        return { startHour: minH, endHour: Math.min(23, maxH + 1) };
+    }, [userProfile.studyTimes]);
+
+    const timeSlots = useMemo(() => {
+        const slots = [];
+        for (let i = startHour; i <= endHour; i++) slots.push(i);
+        return slots;
+    }, [startHour, endHour]);
+
+    const getTaskForSlot = (hour: number) => tasks.find(t => {
+        if (!t.scheduledTime) return false;
+        const [h] = t.scheduledTime.split(':').map(Number);
+        return h === hour;
+    });
+
+    const [currentTimePos, setCurrentTimePos] = useState<number | null>(null);
+
+    useEffect(() => {
+        const updateLine = () => {
+            const now = new Date();
+            const currentH = now.getHours();
+            const currentM = now.getMinutes();
+            if (currentH >= startHour && currentH <= endHour) {
+                // Calculate percentage through the day range
+                const totalHours = endHour - startHour + 1;
+                const hoursPassed = (currentH - startHour) + (currentM / 60);
+                setCurrentTimePos((hoursPassed / totalHours) * 100);
+            } else {
+                setCurrentTimePos(null);
+            }
+        };
+        updateLine();
+        const timer = setInterval(updateLine, 60000);
+        return () => clearInterval(timer);
+    }, [startHour, endHour]);
+
+    return (
+        <div className="glass-panel p-0 rounded-2xl h-[600px] overflow-y-auto custom-scrollbar animate-fade-in relative">
+            <h3 className="text-sm font-bold text-cyan-300 sticky top-0 glass-panel z-20 px-4 py-3 border-b border-white/10 flex justify-between items-center">
+                <span>Timeline</span>
+                <span className="text-[10px] text-gray-500 font-normal">Drag tasks here</span>
+            </h3>
+            
+            <div className="relative px-4 py-2">
+                {currentTimePos !== null && (
+                    <div 
+                        className="absolute left-0 right-0 h-[2px] bg-red-500 z-10 pointer-events-none flex items-center"
+                        style={{ top: `${20 + (currentTimePos / 100) * (timeSlots.length * 64)}px` }} // Approx calculation based on slot height
+                    >
+                        <div className="w-2 h-2 rounded-full bg-red-500 -ml-1"></div>
+                        <span className="text-[9px] text-red-500 glass-panel px-1 ml-auto">Now</span>
+                    </div>
+                )}
+
+                <div className="space-y-1">
+                    {timeSlots.map(hour => {
+                        const task = getTaskForSlot(hour);
+                        const timeLabel = `${hour > 12 ? hour - 12 : (hour === 0 || hour === 24 ? 12 : hour)} ${hour >= 12 && hour < 24 ? 'PM' : 'AM'}`;
+                        
+                        return (
+                            <div 
+                                key={hour} 
+                                className="flex items-start gap-3 group min-h-[4rem] border-b border-white/5 last:border-0"
+                                onDragOver={(e) => e.preventDefault()}
+                                onDrop={(e) => {
+                                    e.preventDefault();
+                                    const taskId = e.dataTransfer.getData('text/plain');
+                                    if (taskId) onDropTask(taskId, hour);
+                                }}
+                            >
+                                <div className="w-14 text-[10px] text-gray-500 text-right pt-2 font-mono flex-shrink-0">{timeLabel}</div>
+                                <div className="flex-grow pt-1 relative h-full min-h-[3.5rem]">
+                                    {task ? (
+                                        <div 
+                                            draggable={true}
+                                            onDragStart={(e) => e.dataTransfer.setData('text/plain', task.id)}
+                                            className={`rounded-md p-2 border border-white/10 shadow-sm text-sm text-gray-200 flex justify-between items-center group-hover:border-cyan-500/50 transition-all cursor-grab active:cursor-grabbing ${task.completed ? 'glass-panel opacity-60' : 'glass-panel'}`}
+                                            style={{ height: `${Math.max(3, (task.estimatedTime / 60) * 3.5)}rem` }}
+                                        >
+                                            <div className="flex flex-col overflow-hidden">
+                                                <span className="truncate font-medium text-xs">{task.text}</span>
+                                                <span className="text-[9px] text-gray-400">{task.estimatedTime}m</span>
+                                            </div>
+                                            <button 
+                                                className="ml-2 text-xs text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center"
+                                                onClick={() => onRemoveTask(task.id)}
+                                                title="Unschedule"
+                                            >
+                                                ×
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="h-full w-full rounded-md border-2 border-dashed border-transparent hover:border-slate-700 transition-colors flex items-center justify-center">
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- NEW COMPONENT: Interactive 4-Quadrant Eisenhower Matrix View ---
+const EisenhowerMatrixView: React.FC<{
+    tasks: DailyTask[];
+    userProfile: UserProfile;
+    logs: QuestionLog[];
+    bioStats?: any;
+    onToggleTask: (id: string) => void;
+    onDeleteTask: (id: string) => void;
+    onStartFocus: (task: DailyTask) => void;
+    onChangeQuadrant: (taskId: string, quad: EisenhowerQuadrant) => void;
+    isTimerActive: boolean;
+    activeTaskId: string | null;
+}> = ({
+    tasks,
+    userProfile,
+    logs,
+    bioStats,
+    onToggleTask,
+    onDeleteTask,
+    onStartFocus,
+    onChangeQuadrant,
+    isTimerActive,
+    activeTaskId
+}) => {
+    const quadrants: EisenhowerQuadrant[] = ['Q1', 'Q2', 'Q3', 'Q4'];
+
+    return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-fade-in">
+            {quadrants.map(quadKey => {
+                const meta = EISENHOWER_QUADRANTS[quadKey];
+                const quadTasks = tasks.filter(t => {
+                    const q = t.eisenhowerQuadrant || classifyEisenhowerQuadrant(t, userProfile, logs, bioStats);
+                    return q === quadKey;
+                });
+                const totalMins = quadTasks.reduce((s, t) => s + (t.completed ? 0 : t.estimatedTime), 0);
+
+                return (
+                    <div 
+                        key={quadKey} 
+                        className={`rounded-2xl p-4 border ${meta.borderAccent} ${meta.bgAccent} backdrop-blur-md flex flex-col justify-between min-h-[320px] shadow-lg`}
+                    >
+                        <div>
+                            {/* Quadrant Header */}
+                            <div className="flex items-start justify-between gap-2 border-b border-white/10 pb-3 mb-2.5">
+                                <div>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xl">{meta.icon}</span>
+                                        <h4 className="font-bold text-white text-sm">{meta.title}</h4>
+                                    </div>
+                                    <p className="text-[11px] text-slate-400 mt-0.5">{meta.subtitle}</p>
+                                </div>
+                                <div className="text-right flex-shrink-0">
+                                    <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold border ${meta.badgeColor}`}>
+                                        {quadTasks.length} {quadTasks.length === 1 ? 'task' : 'tasks'} • {totalMins}m
+                                    </span>
+                                </div>
+                            </div>
+
+                            {/* Guideline quote */}
+                            <div className="text-[10px] text-slate-400 italic mb-3 bg-black/20 p-2 rounded-lg border border-white/5">
+                                {meta.guideline}
+                            </div>
+
+                            {/* Task Cards */}
+                            <div className="space-y-2.5 max-h-[320px] overflow-y-auto pr-1 custom-scrollbar">
+                                {quadTasks.length === 0 ? (
+                                    <div className="text-center py-10 text-xs text-slate-500 border border-dashed border-white/10 rounded-xl">
+                                        No tasks assigned to {meta.id}
+                                    </div>
+                                ) : (
+                                    quadTasks.map(task => (
+                                        <div 
+                                            key={task.id}
+                                            className={`p-3 rounded-xl border border-white/10 glass-panel flex flex-col gap-2 transition-all hover:border-white/20 ${task.completed ? 'opacity-50' : ''}`}
+                                        >
+                                            <div className="flex items-start gap-2.5">
+                                                <input 
+                                                    type="checkbox"
+                                                    checked={task.completed}
+                                                    onChange={() => onToggleTask(task.id)}
+                                                    className="w-4 h-4 mt-0.5 rounded border-white/20 text-cyan-500 glass-panel cursor-pointer flex-shrink-0"
+                                                />
+                                                <div className="flex-grow min-w-0">
+                                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                                        {task.isGhost && !task.completed && (
+                                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
+                                                                👻 Rollover
+                                                            </span>
+                                                        )}
+                                                        {task.sourceModule === 'weak_zone' && (
+                                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-bold border border-rose-500/30">
+                                                                🧬 Weak Zone
+                                                            </span>
+                                                        )}
+                                                        {task.sourceModule === 'formula_vault' && (
+                                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
+                                                                📐 Formula
+                                                            </span>
+                                                        )}
+                                                        {task.sourceModule === 'error_vaccinator' && (
+                                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
+                                                                💉 Vaccine
+                                                            </span>
+                                                        )}
+                                                        {task.priorityScore && (
+                                                            <span className="text-[9px] text-cyan-300 font-mono">
+                                                                [{task.priorityScore} pts]
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <p className={`text-xs font-medium mt-1 leading-snug ${task.completed ? 'line-through text-slate-500' : 'text-slate-200'}`}>
+                                                        {task.text}
+                                                    </p>
+                                                </div>
+                                            </div>
+
+                                            {/* Card Footer: Badges & Controls */}
+                                            <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-white/5">
+                                                <div className="flex items-center gap-2">
+                                                    <span>⏱️ {task.estimatedTime}m</span>
+                                                    <span>•</span>
+                                                    <span className="capitalize">{task.effort ? String(task.effort).split(' ')[0] : 'Medium'}</span>
+                                                </div>
+                                                <div className="flex items-center gap-1.5">
+                                                    <select
+                                                        value={task.eisenhowerQuadrant || quadKey}
+                                                        onChange={(e) => onChangeQuadrant(task.id, e.target.value as EisenhowerQuadrant)}
+                                                        className="bg-slate-800 text-[10px] text-slate-300 rounded px-1.5 py-0.5 border border-white/10 focus:outline-none"
+                                                        title="Move to another Eisenhower Quadrant"
+                                                    >
+                                                        <option value="Q1">Q1 (Do First)</option>
+                                                        <option value="Q2">Q2 (Schedule)</option>
+                                                        <option value="Q3">Q3 (Sprints)</option>
+                                                        <option value="Q4">Q4 (Low)</option>
+                                                    </select>
+                                                    <button
+                                                        onClick={() => onStartFocus(task)}
+                                                        disabled={isTimerActive && activeTaskId !== task.id}
+                                                        className="p-1 text-slate-400 hover:text-cyan-400 transition-colors"
+                                                        title="Focus on this task"
+                                                    >
+                                                        🎯
+                                                    </button>
+                                                    <button
+                                                        onClick={() => onDeleteTask(task.id)}
+                                                        className="p-1 text-slate-400 hover:text-rose-400 transition-colors"
+                                                        title="Delete task"
+                                                    >
+                                                        🗑️
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
+export const DailyPlanner: React.FC<DailyPlannerProps> = ({ 
+    goals, setGoals, apiKey, logs, proactiveInsight, onAcceptPlan, onDismissInsight, addXp, userProfile, prefilledTask, setPrefilledTask, tasks: dailyTasks = [], onUpdateTasks: setDailyTasks = () => {}, modelName,
+    bioStats, setBioStats, dailyQuote: quote, setDailyQuote: setQuote, streakData, setStreakData, endOfDaySummaries: summaries, setEndOfDaySummaries: setSummaries, dailyPlansHistory: planHistory, setDailyPlansHistory: setPlanHistory
+}) => {
+    const [currentTime, setCurrentTime] = useState(new Date());
+    const [activeTab, setActiveTab] = useState<'tasks' | 'weekly' | 'summary' | 'history'>('tasks');
+    const [plannerViewMode, setPlannerViewMode] = useState<'list' | 'eisenhower' | 'timeline'>('list');
+    
+    const [suggestedTasks, setSuggestedTasks] = useState<{task: string, time: number}[] | null>(null);
+    const [isSuggestingTasks, setIsSuggestingTasks] = useState(false);
+    const [smartTasks, setSmartTasks] = useState<{ task: string; time: number; topic: string; }[] | null>(null);
+    const [isGeneratingTasks, setIsGeneratingTasks] = useState(false);
+    const [showSchedule, setShowSchedule] = useState(false);
+    const [accomplishmentModal, setAccomplishmentModal] = useState<{ task: DailyTask } | null>(null);
+    const [isSorting, setIsSorting] = useState(false);
+
+    // Bio Check State
+    const [showBioCheck, setShowBioCheck] = useState(false);
+
+    const [isHyperFocusMode, setIsHyperFocusMode] = useState(false);
+    const [ambientSound, setAmbientSound] = useState<'off' | 'brown' | 'pink' | 'white' | 'alpha' | 'theta'>('off');
+    const [soundVolume, setSoundVolume] = useState(0.15);
+    const [interruptionCount, setInterruptionCount] = useState(0);
+
+    const [newTaskText, setNewTaskText] = useState('');
+    const [newTaskType, setNewTaskType] = useState<TaskType>(TaskType.StudySession);
+    const [newTaskEffort, setNewTaskEffort] = useState<TaskEffort>(TaskEffort.Medium);
+    const [newTaskTime, setNewTaskTime] = useState(30);
+    const [newTaskTopic, setNewTaskTopic] = useState('');
+    const [newWeeklyGoal, setNewWeeklyGoal] = useState('');
+    const [isListening, setIsListening] = useState(false);
+
+    const handleVoiceInput = () => {
+        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            alert("Speech recognition is not supported in this browser.");
+            return;
+        }
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = 'en-US';
+
+        recognition.onstart = () => setIsListening(true);
+        
+        recognition.onresult = (event: any) => {
+            const transcript = event.results[0][0].transcript;
+            setNewTaskText(transcript);
+            setIsListening(false);
+        };
+
+        recognition.onerror = (event: any) => {
+            console.error("Speech recognition error", event.error);
+            setIsListening(false);
+        };
+
+        recognition.onend = () => setIsListening(false);
+
+        recognition.start();
+    };
+
+    const timerModes = { focus: 25 * 60, short: 5 * 60, long: 15 * 60 };
+    const { timerState, setTimerState } = useAppStore();
+    const { mode: timerMode, isActive: isTimerActive, timeLeft, endTime, activeTaskId } = timerState;
+    
+    const timerIntervalRef = useRef<number | null>(null);
+    const [showCustomInput, setShowCustomInput] = useState(false);
+    const [customTime, setCustomTime] = useState(45);
+    const [isCompleted, setIsCompleted] = useState(false);
+    
+    // Find active task from dailyTasks based on activeTaskId
+    const activeTask = useMemo(() => dailyTasks.find(t => t.id === activeTaskId) || null, [dailyTasks, activeTaskId]);
+    const activeStreakCount = useMemo(() => getActiveStreakCount(streakData), [streakData]);
+    
+    const [summary, setSummary] = useState('');
+    const [isSummaryLoading, setIsSummaryLoading] = useState(false);
+    const [isAudioLoading, setIsAudioLoading] = useState(false);
+    const [audioUrl, setAudioUrl] = useState<string | null>(null);
+
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const animationFrameId = useRef<number | null>(null);
+
+    const [lastCompletedTaskId, setLastCompletedTaskId] = useState<string | null>(null);
+
+    // Save Daily Plan to History
+    useEffect(() => {
+        if (dailyTasks.length > 0) {
+            const getLocalDateStr = (date: Date = new Date()) => {
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
+            };
+            const todayStr = getLocalDateStr();
+            setPlanHistory(prev => ({ ...prev, [todayStr]: dailyTasks }));
+        }
+    }, [dailyTasks, setPlanHistory]);
+
+    // Init Bio Check
+    useEffect(() => {
+        if (bioStats) return;
+        
+        const snoozeUntil = localStorage.getItem('bioCheckSnoozeUntil');
+        if (snoozeUntil && Date.now() < parseInt(snoozeUntil, 10)) {
+            return;
+        }
+        
+        const timer = setTimeout(() => setShowBioCheck(true), 1000);
+        return () => clearTimeout(timer);
+    }, [bioStats]);
+
+    const handleBioSave = (data: { sleep: number; stress: number; energy: number }) => {
+        const getLocalDateStr = (date: Date = new Date()) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        const today = getLocalDateStr();
+        setBioStats({ ...data, date: today });
+        setShowBioCheck(false);
+        
+        // Auto-adjust default effort based on bio-feedback
+        if (data.sleep < 6 || data.stress > 7 || data.energy < 4) {
+            setNewTaskEffort(TaskEffort.Low);
+        } else if (data.energy > 8 && data.stress < 4) {
+            setNewTaskEffort(TaskEffort.High);
+        }
+    };
+
+    const handleBioSnooze = () => {
+        const snoozeUntil = Date.now() + 4 * 60 * 60 * 1000;
+        localStorage.setItem('bioCheckSnoozeUntil', snoozeUntil.toString());
+        setShowBioCheck(false);
+    };
+
+    const handleBioSkip = () => {
+        const getLocalDateStr = (date: Date = new Date()) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        const today = getLocalDateStr();
+        setBioStats({ sleep: 0, stress: 0, energy: 0, date: today, skipped: true });
+        setShowBioCheck(false);
+    };
+
+    useEffect(() => {
+        if (prefilledTask) {
+            setNewTaskText(prefilledTask.text || '');
+            setNewTaskType(prefilledTask.taskType || TaskType.StudySession);
+            setNewTaskTime(prefilledTask.estimatedTime || 30);
+            setNewTaskTopic(prefilledTask.linkedTopic || '');
+            if (prefilledTask.taskType === TaskType.MockTest || prefilledTask.taskType === TaskType.ProblemPractice) {
+                setNewTaskEffort(TaskEffort.High);
+            }
+            setPrefilledTask(null);
+        }
+    }, [prefilledTask, setPrefilledTask]);
+
+    useEffect(() => {
+        if (isHyperFocusMode && isTimerActive && ambientSound !== 'off') {
+            if (['brown', 'pink', 'white'].includes(ambientSound)) {
+                audioEngine.playNoise(ambientSound as 'brown'|'pink'|'white', soundVolume);
+            } else if (ambientSound === 'alpha') {
+                audioEngine.playBinaural(400, 10, soundVolume); // 10Hz Alpha Beat (Focus)
+            } else if (ambientSound === 'theta') {
+                audioEngine.playBinaural(400, 6, soundVolume); // 6Hz Theta Beat (Deep Focus)
+            }
+        } else {
+            audioEngine.stop();
+        }
+        return () => audioEngine.stop();
+    }, [isHyperFocusMode, isTimerActive, ambientSound]);
+
+    useEffect(() => { audioEngine.setVolume(soundVolume); }, [soundVolume]);
+
+    const prioritizedWeakTopics = useMemo(() => {
+        const chapterScores: { name: string, score: number }[] = [];
+        // @ts-ignore
+        const allChapters = Object.values(JEE_SYLLABUS).flatMap(subject => subject.flatMap(unit => unit.chapters.map(c => c.name)));
+        allChapters.forEach(chapter => {
+            const progress = userProfile.syllabus[chapter];
+            const chapterLogs = logs.filter(l => l.topic === chapter);
+            const errorCount = chapterLogs.filter(l => l.status === 'Wrong' || l.status === 'Partially Correct').length;
+            let score = 0;
+            if (progress) {
+                if (progress.status === SyllabusStatus.InProgress) score += 5;
+                if (progress.strength === 'weakness') score += 5;
+            }
+            score += errorCount * 2;
+            if (score > 0) chapterScores.push({ name: chapter, score });
+        });
+        return chapterScores.sort((a, b) => b.score - a.score).slice(0, 5).map(item => item.name);
+    }, [logs, userProfile.syllabus]);
+    
+    useEffect(() => {
+        const fetchQuote = async () => {
+            if (quote) return;
+            const today = getISTDateString();
+            try {
+                if (apiKey) {
+                    const newQuoteText = await getDailyQuote(apiKey);
+                    if (newQuoteText && newQuoteText.trim()) {
+                        const newQuote = { text: newQuoteText.replace(/\*/g, '').trim(), date: today };
+                        setQuote(newQuote);
+                        return;
+                    }
+                }
+            } catch (err) {
+                console.warn("[DailyPlanner] AI quote fetch failed or offline, using fallback inspiration:", err);
+            }
+            // Graceful fallback inspirational quotes if offline or API key invalid
+            const fallbackQuotes = [
+                "Every hour of focused study today buys you a lifetime of freedom tomorrow.",
+                "Consistency is the DNA of mastery. Keep pushing forward.",
+                "Success in JEE is the sum of small efforts, repeated day in and day out.",
+                "Master the concepts, stay calm, and trust your preparation.",
+                "Your competition is working right now. Make every minute count."
+            ];
+            const randomFallback = fallbackQuotes[Math.floor(Math.random() * fallbackQuotes.length)];
+            setQuote({ text: randomFallback, date: today });
+        };
+        fetchQuote();
+    }, [apiKey, quote, setQuote]);
+
+    useEffect(() => {
+        const allComplete = dailyTasks.length > 0 && dailyTasks.every(t => t.completed);
+        if (!allComplete) return;
+
+        const todayStr = getISTDateString();
+        const updatedRecord = evaluateStreakOnCompletion(streakData, todayStr);
+        if (updatedRecord.count !== streakData.count || updatedRecord.date !== streakData.date) {
+            setStreakData(updatedRecord);
+        }
+    }, [dailyTasks, streakData, setStreakData]);
+    
+    useEffect(() => { const timerId = setInterval(() => setCurrentTime(new Date()), 1000); return () => clearInterval(timerId); }, []);
+    
+    useEffect(() => {
+        if (!isTimerActive) { if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; } return; }
+        const tick = () => {
+            if (endTime) {
+                const remaining = endTime - Date.now();
+                if (remaining <= 0) {
+                    setTimerState({ timeLeft: 0, isActive: false, endTime: null }); setIsHyperFocusMode(false);
+                    if (activeTask) setAccomplishmentModal({ task: activeTask });
+                    else { setIsCompleted(true); const ctx = new (window.AudioContext || (window as any).webkitAudioContext)(); const osc = ctx.createOscillator(); osc.connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + 0.5); }
+                } else setTimerState({ timeLeft: Math.ceil(remaining / 1000) });
+            }
+        };
+        tick(); timerIntervalRef.current = window.setInterval(tick, 1000);
+        return () => { if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; } };
+    }, [isTimerActive, activeTask, endTime, setTimerState]);
+
+    useEffect(() => {
+        if (isCompleted) {
+            const canvas = canvasRef.current; if (!canvas) return; const ctx = canvas.getContext('2d'); if (!ctx) return;
+            let particles: any[] = []; const particleCount = 100;
+            const createParticles = () => {
+                particles = []; const { width, height } = canvas.getBoundingClientRect(); canvas.width = width; canvas.height = height;
+                const centerX = width / 2; const centerY = height / 2;
+                for (let i = 0; i < particleCount; i++) {
+                    const angle = Math.random() * 2 * Math.PI; const speed = Math.random() * 5 + 2;
+                    particles.push({ x: centerX, y: centerY, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, radius: Math.random() * 2 + 1, color: `rgba(34, 211, 238, ${Math.random()})`, life: 100, });
+                }
+            };
+            const animate = () => {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                particles.forEach((p, i) => {
+                    p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 1;
+                    if (p.life <= 0) particles.splice(i, 1);
+                    else { ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2, false); ctx.fillStyle = p.color; ctx.globalAlpha = p.life / 100; ctx.fill(); ctx.closePath(); }
+                });
+                if (particles.length > 0) animationFrameId.current = requestAnimationFrame(animate); else { ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.globalAlpha = 1; }
+            };
+            createParticles(); animate();
+        }
+        return () => { if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current); };
+    }, [isCompleted]);
+
+    const addDailyTask = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (newTaskText.trim() === '') return;
+        const task: DailyTask = {
+            id: `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            text: newTaskText,
+            completed: false,
+            taskType: newTaskType,
+            effort: newTaskEffort,
+            estimatedTime: newTaskTime,
+            linkedTopic: newTaskTopic || undefined
+        };
+        setDailyTasks(prev => [...prev, task]);
+        setNewTaskText('');
+        setNewTaskType(TaskType.StudySession);
+        setNewTaskTime(30);
+        setNewTaskTopic('');
+        setNewTaskEffort(TaskEffort.Medium);
+    };
+    const toggleDailyTask = (id: string) => { let wasJustCompleted = false; setDailyTasks(prev => prev.map(t => { if (t.id === id) { if (!t.completed) wasJustCompleted = true; const isNowCompleted = !t.completed; if (isNowCompleted) { setLastCompletedTaskId(id); setTimeout(() => setLastCompletedTaskId(null), 600); } return { ...t, completed: isNowCompleted }; } return t; })); if (wasJustCompleted) addXp('completeTask'); };
+    const deleteDailyTask = (id: string) => { setDailyTasks(prev => prev.filter(t => t.id !== id)); };
+    const addWeeklyGoal = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (newWeeklyGoal.trim() === '') return;
+        setGoals(prev => [...prev, {
+            id: `weekly-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            text: newWeeklyGoal,
+            completed: false
+        }]);
+        setNewWeeklyGoal('');
+    };
+    const toggleWeeklyGoal = (id: string) => { setGoals(prev => prev.map(g => g.id === id ? { ...g, completed: !g.completed } : g)); };
+    const deleteWeeklyGoal = (id: string) => { setGoals(prev => prev.filter(g => g.id !== id)); };
+    
+    const handleSmartReschedule = () => {
+        const incompleteTasks = dailyTasks.filter(t => !t.completed);
+        if (incompleteTasks.length === 0) { alert("All tasks completed! Nothing to reschedule."); return; }
+        const completedTasks = dailyTasks.filter(t => t.completed);
+        setDailyTasks([...completedTasks, ...incompleteTasks.map(t => ({...t, scheduledTime: undefined}))]);
+        alert(`Rescheduled ${incompleteTasks.length} tasks to the backlog.`);
+    };
+
+    const handleDeterministicSort = () => {
+        const sorted = sortTasksByPriority(dailyTasks, userProfile, logs, bioStats);
+        setDailyTasks(sorted);
+    };
+
+    const handleAutoSlot = () => {
+        const slotted = autoSlotTasks(dailyTasks, userProfile, { preserveScheduled: false });
+        setDailyTasks(slotted);
+        setPlannerViewMode('timeline');
+        setShowSchedule(true);
+    };
+
+    const handleInjectWeakZones = () => {
+        const newTasks = generateWeakZoneTasks(userProfile, logs, 2);
+        if (newTasks.length === 0) {
+            alert("No critical decaying chapters detected in Weak Zone Radar!");
+            return;
+        }
+        setDailyTasks(prev => [...newTasks, ...prev]);
+    };
+
+    const handleInjectFormulas = () => {
+        const formulaTask = generateFormulaReviewTask(userProfile);
+        setDailyTasks(prev => [formulaTask, ...prev]);
+    };
+
+    const handleInjectErrorVaccine = () => {
+        const errTask = generateErrorVaccineTask(logs);
+        if (!errTask) {
+            alert("No error patterns found in recent test logs to synthesize a vaccine drill!");
+            return;
+        }
+        setDailyTasks(prev => [errTask, ...prev]);
+    };
+
+    const handleEscalateRolloversToQ1 = () => {
+        setDailyTasks(prev => prev.map(t => {
+            if (!t.completed && (t.isGhost || (t.rolloverCount && t.rolloverCount > 0))) {
+                return {
+                    ...t,
+                    eisenhowerQuadrant: 'Q1',
+                    priorityScore: Math.max(t.priorityScore || 50, 92)
+                };
+            }
+            return t;
+        }));
+    };
+
+    const handleSplitRolloverSprints = () => {
+        let newTaskList: DailyTask[] = [];
+        dailyTasks.forEach(t => {
+            if (!t.completed && (t.isGhost || (t.rolloverCount && t.rolloverCount > 0)) && t.estimatedTime >= 45) {
+                const sprints = splitTaskIntoSprints(t);
+                newTaskList.push(...sprints);
+            } else {
+                newTaskList.push(t);
+            }
+        });
+        setDailyTasks(newTaskList);
+    };
+
+    const handleMoveQuadrant = (taskId: string, quad: EisenhowerQuadrant) => {
+        setDailyTasks(prev => prev.map(t => t.id === taskId ? { ...t, eisenhowerQuadrant: quad } : t));
+    };
+
+    const handleSmartSort = async () => {
+        if (dailyTasks.length < 2) return;
+        setIsSorting(true);
+        try {
+            // First run deterministic offline sort for instantaneous feedback
+            const localSorted = sortTasksByPriority(dailyTasks, userProfile, logs, bioStats);
+            setDailyTasks(localSorted);
+
+            // If API key is available, optionally refine with AI
+            if (apiKey) {
+                const orderedIds = await generateSmartTaskOrder(localSorted, userProfile, logs, bioStats, apiKey, modelName);
+                const taskMap = new Map(localSorted.map(t => [t.id, t]));
+                const reorderedTasks = orderedIds.map(id => taskMap.get(id)).filter(Boolean) as DailyTask[];
+                const existingIds = new Set(orderedIds);
+                const remainingTasks = localSorted.filter(t => !existingIds.has(t.id));
+                setDailyTasks([...reorderedTasks, ...remainingTasks]);
+            }
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setIsSorting(false);
+        }
+    };
+
+    const handleScheduleDrop = (taskId: string, hour: number) => {
+        const newTime = `${hour.toString().padStart(2, '0')}:00`;
+        setDailyTasks(prev => prev.map(t => t.id === taskId ? { ...t, scheduledTime: newTime } : t));
+    };
+    const handleUnschedule = (taskId: string) => {
+        setDailyTasks(prev => prev.map(t => t.id === taskId ? { ...t, scheduledTime: undefined } : t));
+    };
+
+    const handleTimerModeChange = (mode: 'focus' | 'short' | 'long' | 'custom') => { 
+        setTimerState({ isActive: false, mode, endTime: null, activeTaskId: null }); 
+        setIsCompleted(false); 
+        if (mode === 'custom') { 
+            setShowCustomInput(true); 
+            setTimerState({ timeLeft: customTime * 60 }); 
+        } else { 
+            setShowCustomInput(false); 
+            setTimerState({ timeLeft: timerModes[mode] }); 
+        } 
+    };
+    
+    const handleTimerToggle = () => { 
+        audioEngine.init(); 
+        setIsCompleted(false); 
+        if (!isTimerActive) { 
+            let newEndTime = endTime;
+            if (!newEndTime) {
+                 newEndTime = Date.now() + timeLeft * 1000;
+            } else {
+                 newEndTime = Date.now() + timeLeft * 1000;
+            }
+            setTimerState({ endTime: newEndTime, isActive: true });
+            if (timerMode === 'focus' || activeTask) setIsHyperFocusMode(true); 
+        } else { 
+            setIsHyperFocusMode(false); 
+            setInterruptionCount(prev => prev + 1);
+            setTimerState({ isActive: false });
+        } 
+    };
+
+    const handleTimerReset = () => { 
+        setTimerState({ isActive: false, endTime: null, activeTaskId: null }); 
+        setIsHyperFocusMode(false); 
+        setIsCompleted(false); 
+        setInterruptionCount(0); 
+        if(timerMode === 'custom') { 
+            setTimerState({ timeLeft: customTime * 60 }); 
+        } else { 
+            setTimerState({ timeLeft: timerModes[timerMode] }); 
+        } 
+    };
+    
+    const handleStartFocus = (task: DailyTask) => { 
+        audioEngine.init(); 
+        setShowCustomInput(false); 
+        setIsCompleted(false); 
+        setInterruptionCount(0); 
+        const newTimeLeft = task.estimatedTime > 0 ? task.estimatedTime * 60 : timerModes.focus;
+        setTimerState({ 
+            activeTaskId: task.id, 
+            isActive: false, 
+            mode: 'focus', 
+            endTime: null, 
+            timeLeft: newTimeLeft 
+        }); 
+        
+        setTimeout(() => { 
+            setTimerState({ 
+                endTime: Date.now() + newTimeLeft * 1000, 
+                isActive: true 
+            }); 
+            setIsHyperFocusMode(true); 
+        }, 100); 
+    };
+    
+    const formatTime = (seconds: number) => { const mins = Math.floor(seconds / 60); const secs = seconds % 60; return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`; };
+    
+    const handleGenerateSummary = async () => { 
+        setIsSummaryLoading(true); 
+        setAudioUrl(null); 
+        try { 
+            const checklistSummary = dailyTasks.map(t => ({text: t.text, completed: t.completed})); 
+            const result = await generateEndOfDaySummary(goals, checklistSummary, apiKey); 
+            const getLocalDateStr = (date: Date = new Date()) => {
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
+            };
+            const todayStr = getLocalDateStr();
+            setSummaries(prev => ({ ...prev, [todayStr]: result }));
+        } catch (error) { 
+            console.error("Failed to generate summary:", error); 
+        } finally { 
+            setIsSummaryLoading(false); 
+        } 
+    };
+    
+    const handlePlaySummaryAudio = async (summaryText: string) => {
+        if (!summaryText || isAudioLoading) return;
+        setIsAudioLoading(true);
+        try {
+            await playTTS(summaryText, apiKey);
+        } catch (e) {
+            console.error(e);
+            alert("Failed to play audio.");
+        } finally {
+            setIsAudioLoading(false);
+        }
+    };
+    const handlePlanForGoal = async (goal: StudyGoal) => { setIsSuggestingTasks(true); setSuggestedTasks(null); try { const newTasks = await generateTasksFromGoal(goal.text, apiKey, modelName); setSuggestedTasks(newTasks); } catch(e) { console.error(e); } finally { setIsSuggestingTasks(false); } };
+    const addSuggestedTask = (task: {task: string, time: number}) => { setDailyTasks(prev => [...prev, { id: `ai-${Date.now()}-${Math.random()}`, text: task.task, completed: false, taskType: TaskType.StudySession, estimatedTime: task.time, effort: TaskEffort.Medium }]); setSuggestedTasks(prev => prev ? prev.filter(t => t.task !== task.task) : null); };
+    const handleGenerateSmartTasks = async () => { setIsGeneratingTasks(true); setSmartTasks(null); try { const newTasks = await generateSmartTasks(prioritizedWeakTopics, bioStats, apiKey, modelName); setSmartTasks(newTasks); } catch (e) { console.error(e); } finally { setIsGeneratingTasks(false); } };
+    const addSmartTask = (task: { task: string; time: number; topic: string }) => {
+        const newTask = {
+            id: `smart-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            text: task.task,
+            completed: false,
+            taskType: TaskType.ProblemPractice,
+            estimatedTime: task.time,
+            linkedTopic: task.topic,
+            effort: TaskEffort.High
+        };
+        setDailyTasks(p => [newTask, ...p]);
+        setSmartTasks(p => p?.filter(t => t.task !== task.task) || null);
+    };
+    
+    const handleSaveAccomplishment = (taskId: string, accomplishment: string) => { 
+        const taxLabel = interruptionCount > 3 ? " (Fragmented Focus ⚠️)" : "";
+        const finalAccomplishment = accomplishment + taxLabel;
+
+        setDailyTasks(prev => prev.map(t => t.id === taskId ? { ...t, accomplishment: finalAccomplishment, completed: true } : t)); 
+        setAccomplishmentModal(null); 
+        setTimerState({ activeTaskId: null }); 
+        setIsCompleted(true); 
+        handleTimerReset(); 
+    };
+
+    const totalPlannedTime = useMemo(() => (dailyTasks || []).reduce((sum, task) => sum + (task.estimatedTime || 0), 0), [dailyTasks]);
+    
+    const totalDuration = timerMode === 'custom' ? customTime * 60 : (activeTask && activeTask.estimatedTime > 0 ? activeTask.estimatedTime * 60 : timerModes[timerMode]);
+    const progress = totalDuration > 0 ? ((totalDuration - timeLeft) / totalDuration) : 0;
+    const TabButton: React.FC<{tabName: 'tasks' | 'weekly' | 'summary' | 'history', label: string}> = ({tabName, label}) => (
+        <button 
+            onClick={() => setActiveTab(tabName)} 
+            className={`py-2 px-3 sm:px-4 font-semibold transition-colors text-xs sm:text-sm rounded-t-md whitespace-nowrap flex-shrink-0 ${activeTab === tabName ? 'glass-panel text-cyan-400 border-b-2 border-cyan-400' : 'glass-panel text-gray-400 hover:bg-white/5 hover:text-white'}`}
+        >
+            {label}
+        </button>
+    );
+
+    const displayedTasks = useMemo(() => {
+        if (showSchedule) {
+            return dailyTasks.filter(t => !t.scheduledTime);
+        }
+        return dailyTasks;
+    }, [dailyTasks, showSchedule]);
+
+    const isRecoveryMode = bioStats && (bioStats.sleep < 6 || bioStats.stress > 7 || bioStats.energy < 4);
+
+    const cognitiveLoadScore = useMemo(() => {
+        return computeCognitiveLoadScore(dailyTasks, logs, bioStats, userProfile.weeklyMoodLog);
+    }, [dailyTasks, logs, bioStats, userProfile.weeklyMoodLog]);
+
+    const capacityReport = useMemo(() => {
+        return computeWorkloadCapacity(dailyTasks, bioStats, cognitiveLoadScore);
+    }, [dailyTasks, bioStats, cognitiveLoadScore]);
+
+    const rolloverTasks = useMemo(() => {
+        return dailyTasks.filter(t => !t.completed && (t.isGhost || (t.rolloverCount && t.rolloverCount > 0)));
+    }, [dailyTasks]);
+
+    const timerBgClass = interruptionCount >= 3 ? 'bg-red-900/30' : interruptionCount > 0 ? 'bg-yellow-900/30' : 'bg-cyan-900/30';
+    const timerTextClass = interruptionCount >= 3 ? 'text-red-500' : interruptionCount > 0 ? 'text-yellow-500' : 'text-cyan-500';
+
+    const realityCheckWarning = useMemo(() => {
+        const text = newTaskText.toLowerCase();
+        if ((text.includes('mock') || text.includes('test') || text.includes('exam')) && newTaskTime < 120) {
+            return "Reality Check: Full tests usually take 2-3 hours. Are you sure this is enough time?";
+        }
+        if (newTaskEffort === TaskEffort.High && newTaskTime < 45) {
+            return "Reality Check: High effort tasks typically require at least 45m of deep focus.";
+        }
+        return null;
+    }, [newTaskText, newTaskTime, newTaskEffort]);
+
+    return (
+        <div className="space-y-6 relative">
+             {showBioCheck && <MorningReadinessWidget onSave={handleBioSave} onSkip={handleBioSkip} onSnooze={handleBioSnooze} />}
+
+             {cognitiveLoadScore < 50 && (
+                 <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-500/40 flex items-center justify-between gap-4 animate-fade-in shadow-lg shadow-rose-950/20">
+                     <div className="flex items-center gap-3">
+                         <span className="text-2xl">🔋</span>
+                         <div>
+                             <div className="flex items-center gap-2">
+                                 <span className="text-xs font-black uppercase text-rose-400">High Cognitive Load (CLS: {cognitiveLoadScore}/100)</span>
+                                 <span className="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold">Fatigue Debt Warning</span>
+                             </div>
+                             <p className="text-xs text-slate-300 mt-0.5">
+                                 Fatigue risk elevated. High-difficulty mocks today yield negative learning ROI. Consider restorative micro-drills or flashcards.
+                             </p>
+                         </div>
+                     </div>
+                 </div>
+             )}
+             
+             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                 {accomplishmentModal && <AccomplishmentModal task={accomplishmentModal.task} onSave={handleSaveAccomplishment} onClose={() => setAccomplishmentModal(null)} interruptionCount={interruptionCount} />}
+                 
+                 {isHyperFocusMode && (
+                <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center animate-fade-in overflow-hidden">
+                    <div className="absolute inset-0 bg-gradient-to-b from-slate-900 via-black to-slate-900 opacity-50 pointer-events-none"></div>
+                    <div className="absolute inset-0 flex items-center justify-center opacity-20 pointer-events-none">
+                         <div className={`w-[600px] h-[600px] ${timerBgClass} rounded-full blur-3xl ${isTimerActive ? 'animate-pulse' : ''}`} style={{ animationDuration: '4s' }}></div>
+                    </div>
+                    <div className="absolute top-6 right-6 z-10">
+                         <button onClick={() => setIsHyperFocusMode(false)} className="text-gray-500 hover:text-white text-sm border border-gray-700 hover:border-gray-500 px-4 py-2 rounded-full transition-all">Exit Focus Mode</button>
+                    </div>
+                    <div className="text-center space-y-8 relative z-10">
+                         <p className={`text-xl ${timerTextClass} font-medium tracking-wide uppercase`}>{activeTask ? activeTask.text : 'Deep Work Session'}</p>
+                         <div className="text-[12rem] font-bold text-white tracking-tighter leading-none tabular-nums select-none drop-shadow-2xl">{formatTime(timeLeft)}</div>
+                         
+                         {interruptionCount > 0 && (
+                             <div className={`text-sm font-medium ${interruptionCount >= 3 ? 'text-red-400' : 'text-yellow-400'} animate-pulse`}>
+                                 {interruptionCount} Interruption{interruptionCount !== 1 ? 's' : ''} Detected
+                             </div>
+                         )}
+                         
+                         <div className="flex items-center gap-8 justify-center mt-8">
+                            <div className="flex flex-col items-center gap-2">
+                                <button onClick={() => { audioEngine.init(); setAmbientSound(prev => prev === 'off' ? 'brown' : 'off'); }} className={`p-4 rounded-full transition-all duration-300 border ${ambientSound !== 'off' ? 'bg-cyan-600 border-cyan-500 text-white shadow-[0_0_30px_rgba(34,211,238,0.4)]' : 'glass-panel text-gray-400 hover:border-gray-500'}`}>
+                                    {ambientSound !== 'off' ? <span className="text-2xl">🔊</span> : <span className="text-2xl">🔇</span>}
+                                </button>
+                                <span className="text-xs text-gray-500 font-medium uppercase tracking-wider">Soundscape</span>
+                            </div>
+                            {ambientSound !== 'off' && (
+                                <div className="glass-panel p-4 rounded-2xl flex gap-4 items-center animate-scale-in">
+                                    <div className="flex gap-1">
+                                        {(['brown', 'pink', 'white'].map(type => (
+                                            <button key={type} onClick={() => { audioEngine.init(); setAmbientSound(type as any); }} className={`px-3 py-1 text-xs rounded-md border uppercase font-bold transition-colors ${ambientSound === type ? 'bg-slate-700/50 backdrop-blur-sm border-cyan-500 text-cyan-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}>{type}</button>
+                                        )))}
+                                        <div className="w-px h-6 bg-white/10 mx-1"></div>
+                                        <button onClick={() => { audioEngine.init(); setAmbientSound('alpha'); }} className={`px-3 py-1 text-xs rounded-md border uppercase font-bold transition-colors ${ambientSound === 'alpha' ? 'bg-indigo-900/50 backdrop-blur-sm border-indigo-500 text-indigo-400' : 'border-transparent text-indigo-400/50 hover:text-indigo-400'}`} title="Alpha Waves (Focus)">Alpha</button>
+                                        <button onClick={() => { audioEngine.init(); setAmbientSound('theta'); }} className={`px-3 py-1 text-xs rounded-md border uppercase font-bold transition-colors ${ambientSound === 'theta' ? 'bg-purple-900/50 backdrop-blur-sm border-purple-500 text-purple-400' : 'border-transparent text-purple-400/50 hover:text-purple-400'}`} title="Theta Waves (Deep Focus)">Theta</button>
+                                    </div>
+                                    <div className="h-8 w-[1px] bg-white/10"></div>
+                                    <input type="range" min="0" max="1" step="0.01" value={soundVolume} onChange={e => setSoundVolume(parseFloat(e.target.value))} className="w-24 h-1 glass-panel rounded-lg appearance-none cursor-pointer accent-cyan-500"/>
+                                </div>
+                            )}
+                         </div>
+                         <div className="mt-12">
+                             <button onClick={handleTimerToggle} className="text-gray-400 hover:text-white transition-colors">{isTimerActive ? 'Pause Timer' : 'Resume'}</button>
+                         </div>
+                    </div>
+                </div>
+             )}
+
+            <div className="lg:col-span-2 space-y-6">
+                <div className="glass-panel p-6 rounded-2xl shadow-lg">
+                    <div className="flex justify-between items-start flex-wrap gap-4">
+                        <div>
+                            <div className="flex items-center gap-4">
+                                <h2 className="text-2xl font-bold text-cyan-300">Daily Planner</h2>
+                            </div>
+                            <p className="text-gray-400 mt-1">{formatDateFull(currentTime.toISOString())}</p>
+                        </div>
+                        <div className="text-right">
+                            <p className="text-4xl font-bold text-white">{currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                        </div>
+                    </div>
+                    {quote && <p className="text-center italic text-xl md:text-2xl font-extrabold mt-6 border-t border-slate-700 pt-6 leading-relaxed text-transparent bg-clip-text bg-gradient-to-r from-cyan-100 to-blue-100 drop-shadow-lg tracking-wide" style={{ textShadow: '0 2px 10px rgba(34,211,238,0.3)' }}>"{quote.text.replace(/\*/g, '')}"</p>}
+                </div>
+                
+                {proactiveInsight?.visible && (
+                    <div className="bg-yellow-900/30 border border-yellow-600/50 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4 animate-glow backdrop-blur-sm">
+                        <div>
+                            <h3 className="font-bold text-yellow-300 flex items-center gap-2">📄 Proactive Insight</h3>
+                            <p className="text-yellow-200/80 text-sm mt-1">
+                                Accuracy in <strong className="capitalize text-yellow-100">{proactiveInsight.subject}</strong> dropped recently. Need a recovery plan?
+                            </p>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={onAcceptPlan} className="bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-1.5 px-4 rounded-lg text-sm shadow-lg transition-transform hover:scale-105">Yes, create plan</button>
+                            <button onClick={onDismissInsight} className="bg-transparent hover:bg-yellow-900/40 text-yellow-300 font-semibold py-1.5 px-4 rounded-lg text-sm transition-colors">Dismiss</button>
+                        </div>
+                    </div>
+                )}
+
+                {isRecoveryMode && (
+                    <div className="bg-indigo-900/30 border border-indigo-500/50 rounded-lg p-4 flex items-center gap-3 animate-fade-in">
+                        <div className="text-2xl">🌿</div>
+                        <div>
+                            <h4 className="font-bold text-indigo-300">Recovery Mode Active</h4>
+                            <p className="text-xs text-indigo-200/80">Bio-rhythm check detected low energy. Recommended tasks set to 'Low' effort. Avoid heavy mocks today.</p>
+                        </div>
+                    </div>
+                )}
+
+                <div>
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-700 mb-4 gap-2">
+                        <div className="flex overflow-x-auto max-w-full pb-1 -mb-px hide-scrollbar w-full sm:w-auto">
+                            <TabButton tabName="tasks" label={`Today's Plan (${formatDuration(totalPlannedTime)})`} />
+                            <TabButton tabName="weekly" label={`Weekly Goals (${goals.length})`} />
+                            <TabButton tabName="summary" label="Summary" />
+                            <TabButton tabName="history" label="History" />
+                        </div>
+                         <button onClick={() => setShowSchedule(p => !p)} className={`text-xs text-white font-semibold py-1.5 px-3 rounded-full transition-colors mb-1 flex items-center gap-2 flex-shrink-0 self-end sm:self-auto ${showSchedule ? 'bg-indigo-600' : 'glass-panel hover:bg-white/5'}`}>
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                            {showSchedule ? 'Hide' : 'Show'} Schedule
+                         </button>
+                    </div>
+
+                    {activeTab === 'tasks' ? (
+                        <div className="space-y-6">
+                            {/* Workload Capacity Bar */}
+                            <div className="glass-panel p-4 rounded-2xl border border-white/10">
+                                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-lg">⚖️</span>
+                                        <div>
+                                            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Daily Workload Capacity</span>
+                                            <div className="text-sm font-bold text-white flex items-center gap-2">
+                                                <span>{formatDuration(capacityReport.totalPlannedMinutes)} Planned</span>
+                                                <span className="text-slate-500 font-normal">/ {formatDuration(capacityReport.recommendedCapMinutes)} Target Cap</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`text-[11px] px-2.5 py-1 rounded-full font-bold border ${
+                                            capacityReport.status === 'optimal' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' :
+                                            capacityReport.status === 'moderate' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' :
+                                            capacityReport.status === 'overload' ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' :
+                                            'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                                        }`}>
+                                            {capacityReport.headline} ({capacityReport.utilizationPercent}%)
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="w-full h-2 rounded-full bg-slate-800/80 overflow-hidden relative">
+                                    <div 
+                                        className={`h-full rounded-full transition-all duration-500 ${
+                                            capacityReport.status === 'optimal' ? 'bg-gradient-to-r from-emerald-500 to-cyan-500' :
+                                            capacityReport.status === 'moderate' ? 'bg-gradient-to-r from-cyan-500 to-amber-500' :
+                                            'bg-gradient-to-r from-amber-500 to-rose-500'
+                                        }`}
+                                        style={{ width: `${Math.min(100, capacityReport.utilizationPercent)}%` }}
+                                    />
+                                </div>
+                                {capacityReport.warningMessage && (
+                                    <p className="text-xs text-rose-300/90 mt-2 flex items-center gap-1.5">
+                                        <span>⚠️</span> {capacityReport.warningMessage}
+                                    </p>
+                                )}
+                            </div>
+
+                            {/* Rollover Triage Alert Banner */}
+                            {rolloverTasks.length > 0 && (
+                                <div className="p-3.5 rounded-xl bg-amber-950/30 border border-amber-500/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 animate-fade-in shadow-md">
+                                    <div className="flex items-center gap-2.5">
+                                        <span className="text-xl">👻</span>
+                                        <div>
+                                            <div className="text-xs font-bold text-amber-300 flex items-center gap-2">
+                                                <span>{rolloverTasks.length} Rolled-Over Task{rolloverTasks.length !== 1 ? 's' : ''} Detected</span>
+                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200">Friction Alert</span>
+                                            </div>
+                                            <p className="text-xs text-slate-300 mt-0.5">
+                                                Deferred tasks accumulate cognitive drag. Escalate priority or split into 20-30m sprints.
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-2 flex-wrap self-end sm:self-auto">
+                                        <button
+                                            type="button"
+                                            onClick={handleEscalateRolloversToQ1}
+                                            className="px-2.5 py-1 rounded-lg bg-rose-600/30 hover:bg-rose-600/50 text-rose-200 border border-rose-500/40 text-xs font-bold transition-all"
+                                            title="Promote all deferred tasks to Urgent Q1"
+                                        >
+                                            Promote to Q1
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={handleSplitRolloverSprints}
+                                            className="px-2.5 py-1 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 text-xs font-bold transition-all"
+                                            title="Split tasks >= 45m into two micro-sprints"
+                                        >
+                                            Split into Sprints
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* View Mode Switcher & Quick Engine Action Toolbar */}
+                            <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-3 glass-panel p-3 rounded-xl border border-white/10">
+                                {/* View Mode Pills */}
+                                <div className="flex items-center gap-1.5 bg-slate-900/60 p-1 rounded-lg border border-white/5 flex-wrap">
+                                    <button
+                                        type="button"
+                                        onClick={() => setPlannerViewMode('list')}
+                                        className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                                            plannerViewMode === 'list' ? 'bg-cyan-600 text-white shadow-md' : 'text-slate-400 hover:text-white'
+                                        }`}
+                                    >
+                                        📋 Task List
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPlannerViewMode('eisenhower')}
+                                        className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                                            plannerViewMode === 'eisenhower' ? 'bg-cyan-600 text-white shadow-md' : 'text-slate-400 hover:text-white'
+                                        }`}
+                                    >
+                                        📊 4-Quadrant Eisenhower
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPlannerViewMode('timeline')}
+                                        className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                                            plannerViewMode === 'timeline' ? 'bg-cyan-600 text-white shadow-md' : 'text-slate-400 hover:text-white'
+                                        }`}
+                                    >
+                                        ⏱️ Timeline Schedule
+                                    </button>
+                                </div>
+
+                                {/* Quick Engine Triggers */}
+                                <div className="flex items-center gap-2 flex-wrap">
+                                    <button
+                                        type="button"
+                                        onClick={handleAutoSlot}
+                                        className="px-2.5 py-1.5 rounded-lg bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-200 border border-cyan-500/40 text-xs font-semibold flex items-center gap-1 transition-all"
+                                        title="Automatically fit tasks into study windows (Morning, Afternoon, Evening)"
+                                    >
+                                        <span>⚡ Auto-Slot</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleDeterministicSort}
+                                        className="px-2.5 py-1.5 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 text-xs font-semibold flex items-center gap-1 transition-all"
+                                        title="Sort mathematically by Eisenhower score, effort, and chapter weight"
+                                    >
+                                        <span>🎯 Prioritize</span>
+                                    </button>
+                                    <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
+                                    <button
+                                        type="button"
+                                        onClick={handleInjectWeakZones}
+                                        className="px-2 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-medium flex items-center gap-1 transition-all"
+                                        title="Inject top decaying chapter drills from Weak Zone Radar"
+                                    >
+                                        <span>🧬 + Weak Zone</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleInjectFormulas}
+                                        className="px-2 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-medium flex items-center gap-1 transition-all"
+                                        title="Inject 15-minute formula recall sprint"
+                                    >
+                                        <span>📐 + Formula</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleInjectErrorVaccine}
+                                        className="px-2 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-medium flex items-center gap-1 transition-all"
+                                        title="Inject error re-attempt drill"
+                                    >
+                                        <span>💉 + Vaccine</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* View Content Branching */}
+                            {plannerViewMode === 'eisenhower' ? (
+                                <EisenhowerMatrixView
+                                    tasks={dailyTasks}
+                                    userProfile={userProfile}
+                                    logs={logs}
+                                    bioStats={bioStats}
+                                    onToggleTask={toggleDailyTask}
+                                    onDeleteTask={deleteDailyTask}
+                                    onStartFocus={handleStartFocus}
+                                    onChangeQuadrant={handleMoveQuadrant}
+                                    isTimerActive={isTimerActive}
+                                    activeTaskId={activeTaskId}
+                                />
+                            ) : plannerViewMode === 'timeline' ? (
+                                <TimeBlockSchedule 
+                                    tasks={dailyTasks} 
+                                    onDropTask={handleScheduleDrop} 
+                                    onRemoveTask={handleUnschedule}
+                                    userProfile={userProfile} 
+                                />
+                            ) : (
+                                <div className={`grid gap-6 transition-all duration-300 ${showSchedule ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
+                                    {/* Left Column: Task List */}
+                                    <div className="space-y-4">
+                                        <form onSubmit={addDailyTask} className="glass-panel rounded-2xl p-4 space-y-4">
+                                            <div className="flex flex-col sm:flex-row gap-3">
+                                                 <div className="flex-grow relative">
+                                                     <input type="text" value={newTaskText} onChange={e => setNewTaskText(e.target.value)} placeholder="What needs doing?" className="w-full p-3 pr-10 glass-panel rounded-lg focus:ring-2 focus:ring-cyan-500 focus:outline-none text-white placeholder-gray-500"/>
+                                                     <button type="button" onClick={handleVoiceInput} className={`absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full transition-colors ${isListening ? 'bg-red-500/20 text-red-400 animate-pulse' : 'text-gray-400 hover:text-cyan-400 hover:bg-slate-800/50'}`} title="Voice Input">
+                                                         <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+                                                     </button>
+                                                 </div>
+                                                 <div className="w-full sm:w-24 flex-shrink-0"><input type="number" value={newTaskTime} onChange={e => setNewTaskTime(parseInt(e.target.value) || 0)} placeholder="Min" className="w-full p-3 glass-panel rounded-lg text-center focus:ring-2 focus:ring-cyan-500 focus:outline-none" title="Estimated Time (minutes)"/></div>
+                                            </div>
+                                            <div className="flex flex-wrap gap-4 justify-between items-center">
+                                                <div className="flex flex-wrap gap-3 w-full sm:w-auto">
+                                                    <div className="flex glass-panel rounded-lg p-1 w-full sm:w-auto justify-between sm:justify-start">
+                                                        {Object.values(TaskEffort).map((effort) => (
+                                                            <button key={effort} type="button" onClick={() => setNewTaskEffort(effort)} className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all flex-1 sm:flex-none justify-center ${newTaskEffort === effort ? effortConfig[effort].color : 'text-gray-400 hover:text-gray-200'}`} title={effort}><span>{effortConfig[effort].icon}</span><span className="hidden sm:inline">{effortConfig[effort].label}</span></button>
+                                                        ))}
+                                                    </div>
+                                                    <select value={newTaskType} onChange={e => setNewTaskType(e.target.value as TaskType)} className="glass-panel text-xs text-gray-300 p-2 rounded-lg focus:outline-none focus:border-cyan-500 w-full sm:w-auto">{Object.entries(taskTypeConfig).map(([key, {name}]) => <option key={key} value={key}>{name}</option>)}</select>
+                                                </div>
+                                                <div className="flex flex-wrap gap-2 w-full sm:w-auto">
+                                                    <button type="button" onClick={handleSmartReschedule} disabled={dailyTasks.filter(t => !t.completed).length === 0} className="bg-orange-600/20 hover:bg-orange-600/40 text-orange-300 hover:text-white border border-orange-600/50 px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed" title="Move incomplete tasks to backlog">
+                                                        📅 Reschedule
+                                                    </button>
+                                                    <button type="button" onClick={handleGenerateSmartTasks} disabled={isGeneratingTasks} className="bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-600/50 px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                                        {isGeneratingTasks ? <span className="animate-spin">↻</span> : '🤖 AI Suggest'}
+                                                    </button>
+                                                    <button type="button" onClick={handleSmartSort} disabled={isSorting || dailyTasks.length < 2} className="bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-600/50 px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                                        {isSorting ? <span className="animate-spin">↻</span> : '✨ Smart Sort'}
+                                                    </button>
+                                                    <button type="submit" className="bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-2 px-6 rounded-lg shadow-lg transition-all hover:shadow-cyan-500/20 w-full sm:w-auto">Add</button>
+                                                </div>
+                                            </div>
+                                            {realityCheckWarning && (
+                                                <div className="text-xs text-yellow-400 bg-yellow-900/20 border border-yellow-800/50 p-2 rounded-lg flex items-center gap-2 animate-fade-in">
+                                                    <span>⚠️</span> {realityCheckWarning}
+                                                </div>
+                                            )}
+                                        </form>
+                                        
+                                        {smartTasks && (
+                                            <div className="p-4 glass-panel rounded-lg animate-scale-in">
+                                                <div className="flex justify-between mb-2"><h4 className="font-bold text-indigo-300">AI Suggestions</h4><button onClick={() => setSmartTasks(null)} className="text-gray-500 hover:text-white text-xl leading-none">&times;</button></div>
+                                                <div className="space-y-2">{smartTasks.map((task, i) => (<div key={i} className="flex justify-between items-center glass-panel p-3 rounded-xl hover:border-indigo-500/50 transition-colors"><div><p className="text-sm text-gray-200 font-medium">{task.task}</p><p className="text-xs text-indigo-300 mt-0.5">Focus: {task.topic} • {task.time} mins</p></div><button onClick={() => addSmartTask(task)} className="text-xs bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded font-bold shadow-lg">Add</button></div>))}</div>
+                                            </div>
+                                        )}
+
+                                        <div className="space-y-3 min-h-[200px]">
+                                            {showSchedule && displayedTasks.length === 0 && dailyTasks.length > 0 && <div className="text-center text-gray-500 py-4 border-2 border-dashed border-slate-800 rounded-lg">All tasks scheduled!</div>}
+                                            {displayedTasks.map((task, index) => {
+                                                const currentQuad = task.eisenhowerQuadrant || classifyEisenhowerQuadrant(task, userProfile, logs, bioStats);
+                                                const quadMeta = EISENHOWER_QUADRANTS[currentQuad];
+
+                                                return (
+                                                    <div 
+                                                        key={task.id} 
+                                                        draggable={showSchedule} 
+                                                        onDragStart={(e) => e.dataTransfer.setData('text/plain', task.id)}
+                                                        className={`group relative p-4 glass-panel rounded-xl flex items-center gap-4 transition-all hover:bg-white/5 ${
+                                                            task.isGhost && !task.completed ? 'border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.15)]' : 'border-white/10 hover:border-white/20'
+                                                        } ${task.completed ? 'opacity-60' : ''} ${lastCompletedTaskId === task.id ? 'animate-power-up' : ''} ${showSchedule ? 'cursor-grab active:cursor-grabbing' : ''}`}
+                                                    >
+                                                        <div className={`absolute left-0 top-4 bottom-4 w-1 rounded-r-full ${taskTypeConfig[task.taskType].color.replace('border-l-', 'bg-')}`}></div>
+                                                        <div className="pl-3"><input type="checkbox" checked={task.completed} onChange={() => toggleDailyTask(task.id)} className="w-5 h-5 rounded border-white/20 text-cyan-500 glass-panel focus:ring-offset-0 focus:ring-2 focus:ring-cyan-500 cursor-pointer"/></div>
+                                                        <div className="flex-grow min-w-0">
+                                                            <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                                                {task.isGhost && !task.completed && <span className="text-red-400 text-sm animate-pulse" title="Unfinished from previous day">👻</span>}
+                                                                <span className={`text-sm font-medium line-clamp-2 sm:line-clamp-1 ${task.completed ? 'line-through text-gray-500' : 'text-gray-200'}`}>{task.text}</span>
+                                                                <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${quadMeta.badgeColor}`}>
+                                                                    {quadMeta.id}
+                                                                </span>
+                                                                {task.sourceModule === 'weak_zone' && (
+                                                                    <span className="text-[10px] bg-rose-900/30 text-rose-300 border border-rose-800 px-1.5 rounded flex-shrink-0">
+                                                                        🧬 Weak Zone
+                                                                    </span>
+                                                                )}
+                                                                {task.sourceModule === 'formula_vault' && (
+                                                                    <span className="text-[10px] bg-amber-900/30 text-amber-300 border border-amber-800 px-1.5 rounded flex-shrink-0">
+                                                                        📐 Formula
+                                                                    </span>
+                                                                )}
+                                                                {task.sourceModule === 'error_vaccinator' && (
+                                                                    <span className="text-[10px] bg-emerald-900/30 text-emerald-300 border border-emerald-800 px-1.5 rounded flex-shrink-0">
+                                                                        💉 Vaccine
+                                                                    </span>
+                                                                )}
+                                                                {task.priorityScore && (
+                                                                    <span className="text-[10px] text-cyan-300 font-mono">
+                                                                        [{task.priorityScore} pts]
+                                                                    </span>
+                                                                )}
+                                                                {task.effort === TaskEffort.High && <span className="text-[10px] bg-red-900/30 text-red-300 border border-red-800 px-1.5 rounded flex-shrink-0">Deep Work</span>}
+                                                            </div>
+                                                            <div className="flex items-center gap-3 text-xs text-gray-500 flex-wrap">
+                                                                <span className="flex items-center gap-1">{taskTypeConfig[task.taskType].icon} {taskTypeConfig[task.taskType].name}</span>
+                                                                <span>•</span>
+                                                                <span>{task.estimatedTime}m</span>
+                                                                {task.scheduledTime && (
+                                                                    <>
+                                                                        <span>•</span>
+                                                                        <span className="text-cyan-400 font-mono">🕒 {task.scheduledTime}</span>
+                                                                    </>
+                                                                )}
+                                                            </div>
+                                                            {task.accomplishment && <div className="mt-2 text-xs text-green-400 bg-green-900/20 p-1.5 rounded border border-green-900/30 inline-block">✓ {task.accomplishment}</div>}
+                                                        </div>
+                                                        <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                            <select
+                                                                value={currentQuad}
+                                                                onChange={(e) => handleMoveQuadrant(task.id, e.target.value as EisenhowerQuadrant)}
+                                                                className="bg-slate-800 text-[10px] text-slate-300 rounded px-1.5 py-1 border border-white/10 focus:outline-none"
+                                                                title="Move Eisenhower Quadrant"
+                                                            >
+                                                                <option value="Q1">Q1 (Do First)</option>
+                                                                <option value="Q2">Q2 (Schedule)</option>
+                                                                <option value="Q3">Q3 (Sprints)</option>
+                                                                <option value="Q4">Q4 (Low)</option>
+                                                            </select>
+                                                            <button onClick={() => handleStartFocus(task)} disabled={isTimerActive && activeTask?.id !== task.id} className="p-2 glass-panel hover:bg-cyan-600 hover:text-white hover:border-cyan-500 rounded-lg text-gray-400 transition-colors" title="Focus on this task"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></button>
+                                                            <button onClick={() => deleteDailyTask(task.id)} className="p-2 glass-panel hover:bg-red-600 hover:text-white hover:border-red-500 rounded-lg text-gray-400 transition-colors" title="Delete task"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+
+                                    {/* Right Column: Schedule */}
+                                    {showSchedule && (
+                                        <TimeBlockSchedule 
+                                            tasks={dailyTasks} 
+                                            onDropTask={handleScheduleDrop} 
+                                            onRemoveTask={handleUnschedule}
+                                            userProfile={userProfile} 
+                                        />
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                        // Weekly Goals Tab
+                         <div className="space-y-6">
+                            <form onSubmit={addWeeklyGoal} className="flex flex-col sm:flex-row gap-3">
+                                <input type="text" value={newWeeklyGoal} onChange={e => setNewWeeklyGoal(e.target.value)} placeholder="Add a goal for this week..." className="flex-grow p-3 glass-panel rounded-lg focus:ring-2 focus:ring-cyan-500 text-white"/>
+                                <button type="submit" className="bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-2 px-6 rounded-lg">Add</button>
+                            </form>
+                            <div className="space-y-3">
+                                {goals.map(goal => (
+                                    <div key={goal.id} className="p-4 glass-panel rounded-xl flex items-center gap-4 group">
+                                        <input type="checkbox" checked={goal.completed} onChange={() => toggleWeeklyGoal(goal.id)} className="w-5 h-5 rounded border-white/20 text-cyan-500 glass-panel focus:ring-offset-0"/>
+                                        <div className="flex-grow"><p className={`transition-colors ${goal.completed ? 'line-through text-gray-500' : 'text-gray-200'}`}>{goal.text}</p></div>
+                                        <button onClick={() => handlePlanForGoal(goal)} disabled={isSuggestingTasks} className="bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white text-xs font-bold py-1 px-3 rounded transition-colors disabled:opacity-40">
+                                            {isSuggestingTasks ? '...' : 'Plan Daily Tasks'}
+                                        </button>
+                                        <button onClick={() => deleteWeeklyGoal(goal.id)} className="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity text-lg">×</button>
+                                    </div>
+                                ))}
+                            </div>
+                            {suggestedTasks && (
+                                <div className="mt-4 p-4 glass-panel rounded-lg animate-scale-in">
+                                    <div className="flex justify-between mb-2"><h4 className="font-bold text-indigo-300">Suggested Breakdown</h4><button onClick={() => setSuggestedTasks(null)} className="text-gray-500 hover:text-white">&times;</button></div>
+                                    <div className="space-y-2">
+                                        {suggestedTasks.map((task, i) => (
+                                            <div key={i} className="flex justify-between items-center glass-panel p-2 rounded-xl">
+                                                <span className="text-sm text-gray-300">{task.task} ({task.time}m)</span>
+                                                <button onClick={() => addSuggestedTask(task)} className="text-xs bg-green-600 hover:bg-green-500 text-white px-2 py-1 rounded">Add</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    
+                    {activeTab === 'summary' && (
+                        <div className="glass-panel p-6 rounded-2xl shadow-lg">
+                            <div className="flex justify-between items-center mb-4">
+                                <h3 className="text-xl font-bold text-cyan-300">End of Day Summary</h3>
+                                <div className="flex gap-2">
+                                    <button onClick={handleGenerateSummary} disabled={isSummaryLoading} className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold py-1.5 px-3 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                        {isSummaryLoading ? 'Analyzing...' : 'Generate Today'}
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                                {Object.keys(summaries as object).length > 0 ? (
+                                    Object.entries(summaries as Record<string, string>)
+                                        .sort((a, b) => new Date(b[0]).getTime() - new Date(a[0]).getTime())
+                                        .map(([date, summaryText]) => (
+                                            <div key={date} className="glass-panel p-4 rounded-xl">
+                                                <div className="flex justify-between items-center mb-3 border-b border-slate-700/50 pb-2">
+                                                    <span className="text-sm font-semibold text-indigo-300">{date}</span>
+                                                    <button 
+                                                        onClick={() => handlePlaySummaryAudio(summaryText)} 
+                                                        disabled={isAudioLoading}
+                                                        className="text-gray-400 hover:text-indigo-300 transition-colors"
+                                                        title="Play Audio"
+                                                    >
+                                                        🔊
+                                                    </button>
+                                                </div>
+                                                <div className="text-gray-300 text-sm leading-relaxed markdown-body">
+                                                    <MarkdownRenderer content={summaryText} title="Daily_Summary" />
+                                                </div>
+                                            </div>
+                                        ))
+                                ) : (
+                                    <div className="text-center py-8">
+                                        <p className="text-gray-400 text-sm">No summaries yet. Generate one at the end of your day!</p>
+                                    </div>
+                                )}
+                            </div>
+                            {audioUrl && (
+                                <audio controls src={audioUrl} className="w-full mt-4 h-8" autoPlay />
+                            )}
+                        </div>
+                    )}
+                    
+                    {activeTab === 'history' && (
+                        <div className="glass-panel p-6 rounded-2xl shadow-lg">
+                            <div className="flex justify-between items-center mb-4">
+                                <h3 className="text-xl font-bold text-cyan-300">Daily Plan History</h3>
+                            </div>
+                            <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                                {Object.keys(planHistory as object).length > 0 ? (
+                                    <div className="space-y-6">
+                                        {Object.entries(planHistory as Record<string, DailyTask[]>)
+                                            .sort((a, b) => new Date(b[0]).getTime() - new Date(a[0]).getTime())
+                                            .map(([date, tasks]) => (
+                                                <div key={date} className="glass-panel rounded-xl overflow-hidden">
+                                                    <div className="glass-panel p-4 border-b border-white/10 font-bold text-indigo-300 flex justify-between items-center">
+                                                        <span>{date}</span>
+                                                        <span className="text-sm font-normal text-gray-400">
+                                                            {tasks.filter(t => t.completed).length} / {tasks.length} Completed
+                                                        </span>
+                                                    </div>
+                                                    <div className="p-4 space-y-2">
+                                                        {tasks.map(task => (
+                                                            <div key={task.id} className={`flex items-center gap-3 p-2 rounded-md ${task.completed ? 'glass-panel opacity-70 border border-white/5' : 'glass-panel'}`}>
+                                                                <div className={`w-4 h-4 rounded-full flex-shrink-0 ${task.completed ? 'bg-cyan-500' : 'border-2 border-white/20'}`}></div>
+                                                                <div className="flex-grow min-w-0">
+                                                                    <p className={`text-sm ${task.completed ? 'line-through text-gray-500' : 'text-gray-200'}`}>{task.text}</p>
+                                                                </div>
+                                                                <div className="text-xs text-gray-500 whitespace-nowrap">
+                                                                    {task.estimatedTime}m
+                                                                </div>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                    </div>
+                                ) : (
+                                    <div className="text-center py-12">
+                                        <p className="text-gray-400 text-lg">No daily plans saved yet.</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            <div className="space-y-6">
+                {bioStats && !(bioStats as any).skipped && !showBioCheck && (
+                    <MorningReadinessSummaryWidget stats={bioStats} />
+                )}
+                <div className="glass-panel p-6 rounded-2xl shadow-lg relative overflow-hidden group">
+                    <div className="absolute inset-0 bg-gradient-to-br from-amber-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                    <div className="text-center relative z-10">
+                         <h3 className="text-lg font-bold text-amber-400 uppercase tracking-wider mb-2">Daily Streak</h3>
+                         <div className="flex items-center justify-center gap-3 mb-1">
+                            <span className="text-6xl font-black text-white drop-shadow-md">{activeStreakCount}</span>
+                            <span className="text-5xl">🔥</span>
+                         </div>
+                         <p className="text-sm text-gray-400">{activeStreakCount > 0 ? 'You are on fire!' : 'Complete all tasks to start.'}</p>
+                    </div>
+                </div>
+                
+                <div className="glass-panel p-6 rounded-2xl shadow-lg">
+                    <h3 className="text-lg font-bold text-cyan-300 mb-6 text-center">Focus Timer</h3>
+                    <div className="relative w-56 h-56 mx-auto mb-8 group cursor-pointer" onClick={handleTimerToggle} title={isTimerActive ? "Click to Pause" : "Click to Start"}>
+                        <svg className="w-full h-full transform -rotate-90 drop-shadow-xl" viewBox="0 0 100 100">
+                            <circle className="text-slate-700" strokeWidth="4" stroke="currentColor" fill="transparent" r="46" cx="50" cy="50" />
+                            <circle className={`transition-all duration-1000 ease-linear ${isTimerActive ? 'text-cyan-400' : 'text-slate-500'}`} strokeWidth="4" strokeDasharray={2 * Math.PI * 46} strokeDashoffset={(2 * Math.PI * 46) * (1 - progress)} strokeLinecap="round" stroke="currentColor" fill="transparent" r="46" cx="50" cy="50" />
+                        </svg>
+                        <div className="absolute inset-0 flex flex-col items-center justify-center">
+                            <span className="text-5xl font-bold text-white tracking-tighter tabular-nums">{formatTime(timeLeft)}</span>
+                            <span className={`text-xs font-semibold uppercase tracking-widest mt-2 ${isTimerActive ? 'text-cyan-400 animate-pulse' : 'text-gray-500'}`}>{isTimerActive ? 'Focusing' : 'Paused'}</span>
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mb-6">
+                        <button onClick={() => handleTimerModeChange('focus')} className={`py-2 rounded-md text-xs font-bold transition-colors ${timerMode === 'focus' ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'glass-panel text-gray-400 hover:bg-white/5'}`}>Focus (25)</button>
+                        <button onClick={() => handleTimerModeChange('short')} className={`py-2 rounded-md text-xs font-bold transition-colors ${timerMode === 'short' ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'glass-panel text-gray-400 hover:bg-white/5'}`}>Short Break (5)</button>
+                        <button onClick={() => handleTimerModeChange('long')} className={`py-2 rounded-md text-xs font-bold transition-colors ${timerMode === 'long' ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'glass-panel text-gray-400 hover:bg-white/5'}`}>Long Break (15)</button>
+                        <button onClick={() => handleTimerModeChange('custom')} className={`py-2 rounded-md text-xs font-bold transition-colors ${timerMode === 'custom' ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'glass-panel text-gray-400 hover:bg-white/5'}`}>Custom</button>
+                    </div>
+                    {showCustomInput && (
+                        <div className="flex justify-center items-center gap-2 mb-6 glass-panel p-2 rounded-xl">
+                            <span className="text-sm text-gray-400">Duration:</span>
+                            <input type="number" value={customTime} onChange={e => { const val = Math.max(1, parseInt(e.target.value) || 1); setCustomTime(val); setTimerState({ timeLeft: val * 60 }); }} className="w-16 p-1 glass-panel rounded text-center text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"/>
+                            <span className="text-sm text-gray-400">min</span>
+                        </div>
+                    )}
+                    <div className="flex gap-2">
+                        <button onClick={handleTimerToggle} className={`flex-grow font-bold py-3 rounded-lg shadow-lg transition-transform active:scale-95 ${isTimerActive ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-cyan-600 hover:bg-cyan-500 text-white'}`}>{isTimerActive ? 'Pause' : 'Start Timer'}</button>
+                        <button onClick={handleTimerReset} className="px-4 glass-panel hover:bg-white/5 text-gray-300 rounded-lg transition-colors" title="Reset">↺</button>
+                    </div>
+                </div>
+                 <FocusAnalyticsWidget logs={logs} />
+            </div>
+            </div>
+            <canvas ref={canvasRef} className="particle-canvas pointer-events-none" />
+        </div>
+    );
+};
