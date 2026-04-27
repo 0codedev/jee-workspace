@@ -1,0 +1,745 @@
+
+import React, { useState, useCallback, useEffect } from 'react';
+import type { TestReport, SubjectData, QuestionLog } from '../types';
+import { QuestionType, TestType, TestSubType, QuestionStatus, DifficultyLevel, ErrorReason } from '../types';
+import { extractDataFromImage } from '../services/geminiService';
+import { exportSingleReportToCsv, exportExtractedQuestionsToCsv } from '../services/sheetParser';
+import { calculateMarks, getMarkingScheme } from '../utils/metrics';
+import { ExamGoalJsonImporter } from './ExamGoalJsonImporter';
+import { HybridCsvImporter } from './HybridCsvImporter';
+import { ImageLightboxModal } from './common/ImageLightboxModal';
+
+interface OcrProcessorProps {
+  onAddData: (data: { report: TestReport; logs: QuestionLog[] }) => void;
+  apiKey: string;
+  modelName?: string; 
+}
+
+const getLocalDateStr = (date: Date = new Date()) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
+const initialReportState: Partial<TestReport> = {
+  testDate: getLocalDateStr(),
+  testName: '',
+  type: TestType.ChapterTest,
+  subType: TestSubType.JEEAdvanced,
+  difficulty: 'Medium',
+  topperScore: 0,
+  physics: { marks: 0, rank: 0, correct: 0, wrong: 0, unanswered: 0, partial: 0, maxMarks: 60 },
+  chemistry: { marks: 0, rank: 0, correct: 0, wrong: 0, unanswered: 0, partial: 0, maxMarks: 60 },
+  maths: { marks: 0, rank: 0, correct: 0, wrong: 0, unanswered: 0, partial: 0, maxMarks: 60 },
+  total: { marks: 0, rank: 0, correct: 0, wrong: 0, unanswered: 0, partial: 0, maxMarks: 180 },
+};
+
+// --- Helper Components ---
+
+const SelectCell: React.FC<{ value: string; onChange: (value: any) => void; options: readonly string[]; }> = ({ value, onChange, options }) => (
+    <select value={value} onChange={e => onChange(e.target.value)} className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md focus:outline-none focus:ring-1 focus:ring-cyan-500 text-xs">
+        {options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+    </select>
+);
+
+const SubjectInputGroup: React.FC<{
+    subjectName: keyof Omit<TestReport, 'id' | 'testDate' | 'testName' | 'type' | 'subType' | 'physicsMetrics' | 'chemistryMetrics' | 'mathsMetrics' | 'totalMetrics' | 'difficulty' | 'topperScore'>;
+    data: SubjectData;
+    onChange: (subject: keyof Omit<TestReport, 'id' | 'testDate' | 'testName' | 'type' | 'subType' | 'difficulty' | 'topperScore'>, field: keyof SubjectData, value: number) => void;
+    confidence?: 'high' | 'medium' | 'low';
+}> = ({ subjectName, data, onChange, confidence }) => {
+    const title = subjectName.charAt(0).toUpperCase() + subjectName.slice(1);
+    const confidenceClass = (confidence === 'medium' || confidence === 'low') ? 'border-yellow-400' : 'border-gray-700/50';
+
+    return (
+        <div className={`grid grid-cols-2 md:grid-cols-3 gap-3 p-4 bg-gray-900/50 rounded-lg border transition-all ${confidenceClass}`}>
+            <h3 className="col-span-full text-lg font-semibold text-[rgb(var(--color-primary-rgb))] flex justify-between">
+                {title}
+                {subjectName !== 'total' && (
+                    <div className="flex items-center gap-2 text-xs font-normal text-gray-400">
+                         Max: 
+                         <input 
+                            type="number" 
+                            value={data.maxMarks || 0} 
+                            onChange={(e) => onChange(subjectName, 'maxMarks', parseInt(e.target.value) || 0)}
+                            className="w-12 p-1 bg-gray-800 border border-gray-600 rounded text-center text-white"
+                         />
+                    </div>
+                )}
+            </h3>
+            {(['marks', 'rank', 'correct', 'wrong', 'unanswered', 'partial'] as (keyof SubjectData)[]).map((key) => {
+                return (
+                    <div key={key}>
+                        <label className="text-sm text-gray-400 capitalize">{key}</label>
+                        <input
+                            type="number"
+                            value={data[key] || 0}
+                            onChange={(e) => onChange(subjectName, key, parseInt(e.target.value, 10) || 0)}
+                            className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow"
+                        />
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
+
+const QuestionLogReviewTable: React.FC<{
+    logs: Partial<QuestionLog>[];
+    setLogs: React.Dispatch<React.SetStateAction<Partial<QuestionLog>[]>>;
+    isManualMode?: boolean;
+    onAddRow?: () => void;
+}> = ({ logs, setLogs, isManualMode, onAddRow }) => {
+
+    const handleLogChange = (index: number, field: keyof QuestionLog, value: any) => {
+        const newLogs = [...logs];
+        const updatedLog = { ...newLogs[index], [field]: value };
+        
+        // Auto-recalculate marks if status or scheme changes
+        if (field === 'status' || field === 'positiveMarks' || field === 'negativeMarks' || field === 'questionType') {
+             // Recalculate marks if scheme is available
+             const newMarks = calculateMarks(updatedLog.status || QuestionStatus.Unanswered, updatedLog.questionType || "Single Correct", updatedLog);
+             if (newMarks !== null) updatedLog.marksAwarded = newMarks;
+        }
+
+        newLogs[index] = updatedLog;
+        setLogs(newLogs);
+    };
+
+    if (logs.length === 0 && !isManualMode) {
+        return <p className="text-sm text-gray-500 text-center py-4">No detailed question data was found in the image.</p>;
+    }
+
+    return (
+        <div>
+            <div className="overflow-x-auto max-h-[400px]">
+                <table className="min-w-full text-xs">
+                    <thead className="bg-slate-700/50 sticky top-0">
+                        <tr>
+                            <th className="p-2 text-left">Q.No</th>
+                            <th className="p-2 text-left">Subject</th>
+                            <th className="p-2 text-left">Status</th>
+                            <th className="p-2 text-center w-16">Marks</th>
+                            <th className="p-2 text-left">Type</th>
+                            <th className="p-2 text-center w-14" title="Correct Marks">+ve</th>
+                            <th className="p-2 text-center w-14" title="Wrong Marks">-ve</th>
+                            <th className="p-2 text-left">Chapter</th>
+                            <th className="p-2 text-left">Topic</th>
+                            <th className="p-2 text-left">Error Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-700">
+                        {logs.map((log, index) => (
+                            <tr key={index} className="hover:bg-slate-700/40">
+                                <td className="p-1 w-16">
+                                     <input
+                                        type="number"
+                                        value={log.questionNumber || ''}
+                                        onChange={e => handleLogChange(index, 'questionNumber', parseInt(e.target.value) || 0)}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                                    />
+                                </td>
+                                <td className="p-1 w-32">
+                                    <SelectCell value={log.subject || 'physics'} onChange={v => handleLogChange(index, 'subject', v)} options={['physics', 'chemistry', 'maths']} />
+                                </td>
+                                <td className="p-1 w-40">
+                                    <SelectCell value={log.status || ''} onChange={v => handleLogChange(index, 'status', v)} options={Object.values(QuestionStatus)} />
+                                </td>
+                                <td className="p-1 w-16">
+                                    <input 
+                                        type="number"
+                                        value={log.marksAwarded ?? ''}
+                                        onChange={e => handleLogChange(index, 'marksAwarded', parseFloat(e.target.value))}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md text-center font-bold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                                    />
+                                </td>
+                                <td className="p-1 w-48">
+                                    <input
+                                        type="text"
+                                        value={log.questionType || ''}
+                                        onChange={e => handleLogChange(index, 'questionType', e.target.value)}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md focus:outline-none focus:ring-1 focus:ring-cyan-500 text-center"
+                                        placeholder="e.g. Single Correct"
+                                        list="qtype-suggestions"
+                                    />
+                                    <datalist id="qtype-suggestions">
+                                        {Object.values(QuestionType).map(type => <option key={type} value={type} />)}
+                                    </datalist>
+                                </td>
+                                <td className="p-1 w-14">
+                                    <input 
+                                        type="number"
+                                        value={log.positiveMarks ?? ''}
+                                        onChange={e => handleLogChange(index, 'positiveMarks', parseFloat(e.target.value))}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md text-center text-green-400 font-bold focus:outline-none"
+                                        placeholder="+4"
+                                    />
+                                </td>
+                                <td className="p-1 w-14">
+                                    <input 
+                                        type="number"
+                                        value={log.negativeMarks ?? ''}
+                                        onChange={e => handleLogChange(index, 'negativeMarks', parseFloat(e.target.value))}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md text-center text-red-400 font-bold focus:outline-none"
+                                        placeholder="-1"
+                                    />
+                                </td>
+                                <td className="p-1">
+                                    <input
+                                        type="text"
+                                        value={log.chapter || ''}
+                                        onChange={e => handleLogChange(index, 'chapter', e.target.value)}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                                        placeholder="e.g., Mechanics"
+                                    />
+                                </td>
+                                <td className="p-1">
+                                    <input
+                                        type="text"
+                                        value={log.topic || ''}
+                                        onChange={e => handleLogChange(index, 'topic', e.target.value)}
+                                        className="w-full bg-slate-700 p-1 border border-slate-600 rounded-md focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                                        placeholder="e.g., Rotational Motion"
+                                    />
+                                </td>
+                                <td className="p-1">
+                                    <SelectCell value={log.reasonForError || ''} onChange={(v: string) => handleLogChange(index, 'reasonForError', v)} options={['', ...Object.values(ErrorReason) as string[]]} />
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                 {logs.length === 0 && isManualMode && <p className="text-sm text-gray-500 text-center py-4">Click "Add Question" to start building your log.</p>}
+            </div>
+            {/* Always show Add Question button in review mode to allow manual fixes */}
+            {(isManualMode || true) && (
+                <div className="pt-2 text-center border-t border-slate-700">
+                    <button onClick={onAddRow} className="text-sm bg-indigo-600/50 hover:bg-indigo-600 text-white font-semibold py-1 px-3 rounded-full transition-colors mt-2">
+                        + Add Question
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const SkeletonLoader = () => (
+    <div className="mt-6 space-y-4 animate-pulse">
+        <h3 className="h-6 w-1/3 bg-gray-700 rounded"></h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="h-12 bg-gray-700 rounded-md"></div>
+            <div className="h-12 bg-gray-700 rounded-md"></div>
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="h-48 bg-gray-700 rounded-lg"></div>
+            <div className="h-48 bg-gray-700 rounded-lg"></div>
+            <div className="h-48 bg-gray-700 rounded-lg"></div>
+            <div className="h-48 bg-gray-700 rounded-lg"></div>
+        </div>
+        <div className="h-40 bg-gray-700 rounded-lg"></div>
+    </div>
+);
+
+
+export const OcrProcessor: React.FC<OcrProcessorProps> = ({ onAddData, apiKey, modelName }) => {
+  const [entryMode, setEntryMode] = useState<'ocr' | 'manual' | 'csv' | null>(null);
+  const [workflowStep, setWorkflowStep] = useState<'upload' | 'processing' | 'review'>('upload');
+
+  // Image 1: Score Sheet
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  // Image 2: Instruction Sheet (Optional)
+  const [instructionFile, setInstructionFile] = useState<File | null>(null);
+  const [instructionPreviewUrl, setInstructionPreviewUrl] = useState<string | null>(null);
+
+  const [error, setError] = useState<string | null>(null);
+
+  const [extractedData, setExtractedData] = useState<Partial<TestReport>>(initialReportState);
+  const [extractedConfidence, setExtractedConfidence] = useState<Record<string, 'high'|'medium'|'low'>>({});
+  const [extractedLogs, setExtractedLogs] = useState<Partial<QuestionLog>[]>([]);
+
+  const [validationWarnings, setValidationWarnings] = useState<string[]>([]);
+  const [isValidating, setIsValidating] = useState(false);
+  const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+
+  const handleReset = () => {
+      setEntryMode(null);
+      setWorkflowStep('upload');
+      setImageFile(null);
+      setPreviewUrl(null);
+      setInstructionFile(null);
+      setInstructionPreviewUrl(null);
+      setError(null);
+      setExtractedData(initialReportState);
+      setExtractedConfidence({});
+      setExtractedLogs([]);
+      setValidationWarnings([]);
+  };
+  const [useStrictPrompt, setUseStrictPrompt] = useState<boolean>(true);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, type: 'score' | 'instruction') => {
+      const file = e.target.files?.[0];
+      if (file) {
+          const url = URL.createObjectURL(file);
+          if (type === 'score') {
+              setImageFile(file);
+              setPreviewUrl(url);
+          } else {
+              setInstructionFile(file);
+              setInstructionPreviewUrl(url);
+          }
+      }
+  };
+
+  const processImage = useCallback(async () => {
+    if (!imageFile) return;
+    setWorkflowStep('processing');
+    setError(null);
+    
+    // Use selected model for OCR as per user settings (defaults to gemini-3.5-flash-lite)
+    const VISION_MODEL = modelName || 'gemini-3.5-flash-lite';
+    console.debug(`Processing image with dedicated vision model: ${VISION_MODEL} (strict prompt: ${useStrictPrompt})`);
+
+    try {
+      // Use selected model for OCR as per setting, passing both files & prompt toggle
+      const { report, questions, confidence } = await extractDataFromImage(imageFile, apiKey, VISION_MODEL, instructionFile || undefined, useStrictPrompt);
+      
+      // Removed separate inference call. The prompt now handles type/subtype logic directly.
+
+      // Format question type string to include marking scheme if separated by AI
+      const formattedQuestions = questions.map(q => {
+          let formattedType = q.questionType || "Single Correct";
+          // If positive/negative marks are present, ensure they are part of the string for display preference
+          if (q.positiveMarks !== undefined && q.negativeMarks !== undefined) {
+              // Avoid double formatting if AI already included it
+              if (!formattedType.includes('(')) {
+                  formattedType = `${formattedType} (+${q.positiveMarks}, ${q.negativeMarks})`;
+              }
+          }
+          return { ...q, questionType: formattedType };
+      });
+
+      // Merge while ensuring maxMarks are respected if present
+      setExtractedData(prev => ({
+          ...prev, 
+          ...report,
+          physics: { ...prev.physics, ...report.physics, maxMarks: report.physics?.maxMarks || prev.physics?.maxMarks },
+          chemistry: { ...prev.chemistry, ...report.chemistry, maxMarks: report.chemistry?.maxMarks || prev.chemistry?.maxMarks },
+          maths: { ...prev.maths, ...report.maths, maxMarks: report.maths?.maxMarks || prev.maths?.maxMarks },
+          total: { ...prev.total, ...report.total, maxMarks: report.total?.maxMarks || prev.total?.maxMarks }
+      }));
+      setExtractedConfidence(confidence);
+      setExtractedLogs(formattedQuestions);
+      
+      setWorkflowStep('review');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unknown error occurred.');
+      setWorkflowStep('upload'); // Go back to upload step on error
+    }
+  }, [imageFile, instructionFile, apiKey]); 
+
+    const handleInputChange = <K extends keyof Omit<TestReport, 'id'>>(
+        key: K,
+        value: Omit<TestReport, 'id'>[K]
+    ) => {
+        setExtractedData(prev => ({...prev, [key]: value}));
+    };
+
+    const handleSubjectChange = (
+        subject: keyof Omit<TestReport, 'id' | 'testDate' | 'testName' | 'type' | 'subType' | 'difficulty' | 'topperScore'>,
+        field: keyof SubjectData,
+        value: number
+    ) => {
+        setExtractedData(prev => ({
+            ...prev,
+            [subject]: {
+                ...(prev[subject] as SubjectData),
+                [field]: value
+            }
+        }));
+    };
+
+  const addQuestionLog = () => {
+    setExtractedLogs(prev => {
+        const nextQuestionNumber = prev.length > 0 ? Math.max(...prev.map(l => l.questionNumber || 0)) + 1 : 1;
+        return [
+            ...prev,
+            { 
+                questionNumber: nextQuestionNumber, 
+                subject: 'physics', 
+                status: QuestionStatus.Unanswered, 
+                questionType: "Single Correct (+4, -1)",
+                positiveMarks: 4,
+                negativeMarks: -1,
+                topic: 'N/A', 
+                marksAwarded: 0 
+            }
+        ];
+    });
+  };
+
+  const handleSave = () => {
+    if (!extractedData.testName || extractedData.testName.trim() === '') {
+        setError("Test Name is required.");
+        return;
+    }
+    const reportId = `test-${Date.now()}`;
+    
+    // Recalculate total from subjects to ensure consistency
+    const subjects: (keyof TestReport)[] = ['physics', 'chemistry', 'maths'];
+    const total: SubjectData = {
+        marks: 0, rank: 0, correct: 0, wrong: 0, unanswered: 0, partial: 0, maxMarks: 0
+    };
+    subjects.forEach(s => {
+        const data = extractedData[s] as SubjectData;
+        if (data) {
+            total.marks += data.marks || 0;
+            total.correct += data.correct || 0;
+            total.wrong += data.wrong || 0;
+            total.unanswered += data.unanswered || 0;
+            total.partial += data.partial || 0;
+            total.maxMarks += data.maxMarks || 0;
+        }
+    });
+    // If AI extracted a rank for total, keep it, otherwise use 0
+    total.rank = extractedData.total?.rank || 0;
+    
+    const finalizedData = {
+        ...extractedData,
+        total
+    };
+
+    const newReport: TestReport = {
+        ...(finalizedData as Omit<TestReport, 'id'>),
+        id: reportId
+    };
+    
+    const newLogs: QuestionLog[] = extractedLogs.map((log, index) => ({
+      ...log,
+      testId: reportId,
+      subject: log.subject || 'physics',
+      questionNumber: log.questionNumber || index + 1,
+      // Use the exact string provided by AI/User, do not fallback to default enum unless empty
+      questionType: log.questionType || "Single Correct", 
+      status: log.status || QuestionStatus.Unanswered,
+      marksAwarded: log.marksAwarded || 0,
+      topic: log.topic || 'N/A',
+    } as QuestionLog));
+
+    onAddData({ report: newReport, logs: newLogs });
+    handleReset();
+  };
+  
+  const handleExportSummary = () => {
+      const reportToExport: TestReport = {
+        ...(extractedData as Omit<TestReport, 'id'>),
+        id: `temp-export-${Date.now()}`
+      };
+      exportSingleReportToCsv(reportToExport);
+  };
+
+  const handleExportQuestions = () => {
+    exportExtractedQuestionsToCsv(extractedData, extractedLogs);
+  };
+
+  const handleImportedData = (data: { report: TestReport; logs: QuestionLog[] }) => {
+    setExtractedData(data.report);
+    setExtractedLogs(data.logs);
+    setEntryMode('ocr');
+    setWorkflowStep('review');
+  };
+
+  const title = entryMode === 'ocr' ? 'Automated Data Input (OCR)' : entryMode === 'manual' ? 'Manual Data Input' : entryMode === 'csv' ? 'Hybrid CSV / TSV Importer' : 'Add New Report';
+
+  return (
+    <div className="glass-panel p-4 rounded-2xl">
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold mb-6 text-cyan-300">{title}</h2>
+        {entryMode && (
+            <button onClick={handleReset} className="text-sm bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-md">Start Over</button>
+        )}
+      </div>
+
+      {error && <p className="text-red-400 my-4 bg-red-900/50 p-3 rounded-lg">{error}</p>}
+      
+      {!entryMode && (
+        <div className="flex flex-col gap-6 animate-fade-in">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div onClick={() => setEntryMode('ocr')} className="p-6 bg-slate-800/50 rounded-lg border border-slate-700 hover:border-cyan-400 hover:scale-105 transition-all cursor-pointer text-center flex flex-col justify-between">
+                    <div>
+                      <div className="text-5xl mb-4">📸</div>
+                      <h3 className="text-xl font-bold text-cyan-300">Automated Entry (OCR)</h3>
+                      <p className="text-gray-400 mt-2 text-sm">Upload an image of your score sheet and let AI extract data.</p>
+                    </div>
+                    <span className="mt-4 text-xs font-semibold text-cyan-400 bg-cyan-950/60 py-1 px-2 rounded-full border border-cyan-500/30">AI Extraction</span>
+                </div>
+                <div onClick={() => setEntryMode('csv')} className="p-6 bg-slate-800/50 rounded-lg border border-slate-700 hover:border-emerald-400 hover:scale-105 transition-all cursor-pointer text-center flex flex-col justify-between">
+                    <div>
+                      <div className="text-5xl mb-4">⚡</div>
+                      <h3 className="text-xl font-bold text-emerald-400">Hybrid CSV / TSV</h3>
+                      <p className="text-gray-400 mt-2 text-sm">Paste Excel rows directly. Zero AI lag, zero error risk + local image.</p>
+                    </div>
+                    <span className="mt-4 text-xs font-semibold text-emerald-400 bg-emerald-950/60 py-1 px-2 rounded-full border border-emerald-500/30">Recommended (Instant)</span>
+                </div>
+                <div onClick={() => { setEntryMode('manual'); setWorkflowStep('review'); }} className="p-6 bg-slate-800/50 rounded-lg border border-slate-700 hover:border-indigo-400 hover:scale-105 transition-all cursor-pointer text-center flex flex-col justify-between">
+                    <div>
+                      <div className="text-5xl mb-4">✍️</div>
+                      <h3 className="text-xl font-bold text-indigo-300">Manual Entry</h3>
+                      <p className="text-gray-400 mt-2 text-sm">Fill out the report form and question log by hand.</p>
+                    </div>
+                    <span className="mt-4 text-xs font-semibold text-indigo-400 bg-indigo-950/60 py-1 px-2 rounded-full border border-indigo-500/30">Full Control</span>
+                </div>
+            </div>
+            <div className="w-full">
+                <ExamGoalJsonImporter onImportedData={handleImportedData} />
+            </div>
+        </div>
+      )}
+
+      {entryMode === 'csv' && (
+        <HybridCsvImporter onAddData={handleImportedData} onCancel={handleReset} />
+      )}
+
+      {entryMode === 'ocr' && workflowStep === 'upload' && (
+        <div className="animate-fade-in space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Main Score Sheet Upload */}
+              <div className="flex flex-col gap-2">
+                  <label className="text-sm font-bold text-gray-300">1. Score Sheet (Required)</label>
+                  <div className={`border-2 border-dashed border-gray-600 rounded-lg p-4 flex flex-col items-center justify-center min-h-[200px] hover:border-[rgb(var(--color-primary-rgb))] transition-colors ${previewUrl ? 'bg-slate-800' : 'bg-slate-800/50'}`}>
+                      {previewUrl ? (
+                          <div className="relative w-full h-full flex flex-col items-center">
+                              <img 
+                                  src={previewUrl} 
+                                  alt="Score sheet preview" 
+                                  onClick={() => setLightboxImage(previewUrl)}
+                                  className="max-h-48 rounded-lg object-contain cursor-pointer hover:opacity-80 transition-opacity" 
+                                  title="Click to preview high-res or open in Windows Photos"
+                              />
+                              <label htmlFor="file-upload-score" className="mt-2 text-xs text-cyan-400 cursor-pointer hover:underline">Change Image</label>
+                          </div>
+                      ) : (
+                          <label htmlFor="file-upload-score" className="cursor-pointer flex flex-col items-center text-center">
+                              <span className="text-4xl mb-2">📄</span>
+                              <span className="text-sm text-gray-400">Click to upload Score Sheet</span>
+                              <span className="text-xs text-gray-500 mt-1">(Marks, Ranks, Question Grid)</span>
+                          </label>
+                      )}
+                      <input id="file-upload-score" type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => handleFileChange(e, 'score')} />
+                  </div>
+              </div>
+
+              {/* Instruction/Model Sheet Upload */}
+              <div className="flex flex-col gap-2">
+                  <label className="text-sm font-bold text-gray-300">2. Instruction Sheet (Recommended)</label>
+                  <div className={`border-2 border-dashed border-gray-600 rounded-lg p-4 flex flex-col items-center justify-center min-h-[200px] hover:border-purple-500 transition-colors ${instructionPreviewUrl ? 'bg-slate-800' : 'bg-slate-800/50'}`}>
+                      {instructionPreviewUrl ? (
+                          <div className="relative w-full h-full flex flex-col items-center">
+                              <img 
+                                  src={instructionPreviewUrl} 
+                                  alt="Instruction sheet preview" 
+                                  onClick={() => setLightboxImage(instructionPreviewUrl)}
+                                  className="max-h-48 rounded-lg object-contain cursor-pointer hover:opacity-80 transition-opacity" 
+                                  title="Click to preview high-res or open in Windows Photos"
+                              />
+                              <label htmlFor="file-upload-instruction" className="mt-2 text-xs text-purple-400 cursor-pointer hover:underline">Change Image</label>
+                          </div>
+                      ) : (
+                          <label htmlFor="file-upload-instruction" className="cursor-pointer flex flex-col items-center text-center">
+                              <span className="text-4xl mb-2">📑</span>
+                              <span className="text-sm text-gray-400">Click to upload Marking Scheme</span>
+                              <span className="text-xs text-gray-500 mt-1">(Extracts +4/-1, +3/0 details automatically)</span>
+                          </label>
+                      )}
+                      <input id="file-upload-instruction" type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => handleFileChange(e, 'instruction')} />
+                  </div>
+              </div>
+          </div>
+
+          {imageFile && (
+            <div className="pt-4 space-y-4">
+                {/* Prompt Injection Toggle Switch */}
+                <div className="p-4 bg-slate-800/90 border border-indigo-500/30 rounded-xl flex items-center justify-between gap-4 shadow-lg backdrop-blur-sm">
+                    <div className="flex items-center gap-3">
+                        <div className={`p-2.5 rounded-lg text-xl font-bold ${useStrictPrompt ? 'bg-indigo-500/20 text-indigo-400' : 'bg-slate-700 text-slate-400'}`}>
+                            📜
+                        </div>
+                        <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-sm font-bold text-white">Inject Strict Formatted JEE Prompt</span>
+                                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider border ${
+                                    useStrictPrompt 
+                                        ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' 
+                                        : 'bg-amber-500/20 text-amber-400 border-amber-500/30'
+                                }`}>
+                                    {useStrictPrompt ? 'ON (Strict Rules Injected)' : 'OFF (Dynamic General OCR)'}
+                                </span>
+                            </div>
+                            <p className="text-xs text-slate-300 mt-1">
+                                {useStrictPrompt 
+                                    ? 'Enforces exact JEE header, row matching, and CTA/WTA rules. Best for standard score sheets.' 
+                                    : 'Disables strict rules. Allows advanced vision models (Gemini 3.5/3.6 Flash) to process custom/unconventional mark sheet formats.'}
+                            </p>
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => setUseStrictPrompt(!useStrictPrompt)}
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${useStrictPrompt ? 'bg-indigo-600' : 'bg-slate-700'}`}
+                        role="switch"
+                        aria-checked={useStrictPrompt}
+                        title="Toggle prompt injection ON/OFF"
+                    >
+                        <span
+                            className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${useStrictPrompt ? 'translate-x-5' : 'translate-x-0'}`}
+                        />
+                    </button>
+                </div>
+
+                <div className="flex justify-center">
+                    <button
+                    onClick={processImage}
+                    className="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3.5 px-10 rounded-xl transition-all duration-300 ease-in-out shadow-lg hover:shadow-indigo-500/50 flex items-center justify-center gap-3 text-base"
+                    >
+                    <span>⚡</span> Process Images with AI ({modelName || 'Gemini 3.5 Flash Lite'})
+                    </button>
+                </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {entryMode === 'ocr' && workflowStep === 'processing' && (
+         <div className="animate-fade-in">
+             <p className="text-center text-lg text-indigo-300 mb-4">Analyzing image{instructionFile ? 's' : ''} and extracting data using {modelName || 'Gemini'}... This may take a moment.</p>
+             <SkeletonLoader />
+         </div>
+      )}
+
+      {workflowStep === 'review' && (
+        <div className="animate-fade-in mt-6 space-y-6">
+            {/* AI Validation Banner */}
+            {isValidating ? (
+                <div className="bg-blue-900/20 p-3 rounded-lg border border-blue-700 text-blue-300 text-sm flex items-center gap-2 animate-pulse">
+                    <span className="text-lg">🤖</span> Running AI Sanity Check...
+                </div>
+            ) : validationWarnings.length > 0 ? (
+                <div className="bg-amber-900/20 p-4 rounded-lg border border-amber-700 text-amber-200 text-sm">
+                    <div className="flex items-center gap-2 mb-2 font-bold">
+                        <span className="text-xl">⚠️</span> AI detected potential inconsistencies:
+                    </div>
+                    <ul className="list-disc pl-5 space-y-1 text-amber-100/80">
+                        {validationWarnings.map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                </div>
+            ) : (entryMode === 'ocr' && (
+                <div className="bg-green-900/20 p-3 rounded-lg border border-green-700 text-green-300 text-sm flex items-center gap-2">
+                    <span className="text-lg">✅</span> AI Sanity Check Passed. Data looks consistent.
+                </div>
+            ))}
+
+            <div>
+                <h3 className="text-xl font-semibold border-b border-gray-600 pb-2 text-[rgb(var(--color-primary))]">{entryMode === 'ocr' ? 'Step 2: ' : ''}Review & Correct Summary</h3>
+                {entryMode === 'ocr' && <p className="text-sm text-gray-400 mt-2">AI has extracted the following summary. Fields highlighted in yellow had lower confidence and may need your attention.</p>}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                 <div>
+                    <label className="text-sm text-gray-400">Test Name</label>
+                    <input
+                        type="text"
+                        value={extractedData.testName}
+                        onChange={(e) => handleInputChange('testName', e.target.value)}
+                        className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow"
+                    />
+                </div>
+                <div>
+                    <label className="text-sm text-gray-400">Test Date</label>
+                    <input
+                        type="date"
+                        value={extractedData.testDate}
+                        onChange={(e) => handleInputChange('testDate', e.target.value)}
+                        className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow"
+                    />
+                </div>
+                <div>
+                    <label className="text-sm text-gray-400">Test Type</label>
+                    <select value={extractedData.type} onChange={(e) => handleInputChange('type', e.target.value as TestType)} className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow">
+                        {Object.values(TestType).map(type => <option key={type} value={type}>{type}</option>)}
+                    </select>
+                </div>
+                 <div>
+                    <label className="text-sm text-gray-400">Sub-Type</label>
+                    <select value={extractedData.subType} onChange={(e) => handleInputChange('subType', e.target.value as TestSubType)} className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow">
+                         {Object.values(TestSubType).map(type => <option key={type} value={type}>{type}</option>)}
+                    </select>
+                </div>
+                <div>
+                    <label className="text-sm text-gray-400">Difficulty</label>
+                    <select value={extractedData.difficulty} onChange={(e) => handleInputChange('difficulty', e.target.value as DifficultyLevel)} className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow">
+                         <option value="Easy">Easy</option>
+                         <option value="Medium">Medium</option>
+                         <option value="Hard">Hard</option>
+                    </select>
+                </div>
+                <div>
+                    <label className="text-sm text-gray-400">Topper Score (Optional)</label>
+                     <input
+                        type="number"
+                        value={extractedData.topperScore || ''}
+                        placeholder="e.g. 160"
+                        onChange={(e) => handleInputChange('topperScore', parseInt(e.target.value) || 0)}
+                        className="w-full mt-1 p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-[rgb(var(--color-primary-rgb))] focus:outline-none transition-shadow"
+                    />
+                </div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <SubjectInputGroup subjectName="physics" data={extractedData.physics!} onChange={handleSubjectChange} confidence={extractedConfidence.physics} />
+                <SubjectInputGroup subjectName="chemistry" data={extractedData.chemistry!} onChange={handleSubjectChange} confidence={extractedConfidence.chemistry}/>
+                <SubjectInputGroup subjectName="maths" data={extractedData.maths!} onChange={handleSubjectChange} confidence={extractedConfidence.maths}/>
+                <SubjectInputGroup subjectName="total" data={extractedData.total!} onChange={handleSubjectChange} confidence={extractedConfidence.total}/>
+            </div>
+            
+            <div>
+                 <h3 className="text-xl font-semibold border-b border-gray-600 pb-2 text-[rgb(var(--color-primary))]">{entryMode === 'ocr' ? 'Step 3: ' : ''}Review & Correct Question Details</h3>
+                 <p className="text-sm text-gray-400 mt-2">Correct any errors in the question-by-question data below before saving. <span className="text-yellow-300">Verify marks if using Instruction Sheet.</span></p>
+                 <div className="mt-4 bg-gray-900/50 rounded-lg border border-gray-700/50">
+                    <QuestionLogReviewTable logs={extractedLogs} setLogs={setExtractedLogs} isManualMode={true} onAddRow={addQuestionLog}/>
+                 </div>
+            </div>
+            
+            <div className="flex flex-col sm:flex-row justify-between items-center gap-4 mt-6 pt-6 border-t border-gray-700">
+                <details className="w-full sm:w-auto">
+                    <summary className="text-sm text-gray-400 cursor-pointer hover:text-white">Export Options</summary>
+                    <div className="mt-2 flex flex-col sm:flex-row gap-2">
+                         <button onClick={handleExportSummary} className="bg-green-600/50 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg text-sm">Export Summary CSV</button>
+                         <button onClick={handleExportQuestions} className="bg-teal-600/50 hover:bg-teal-600 text-white font-bold py-2 px-4 rounded-lg text-sm">Export Questions CSV</button>
+                    </div>
+                </details>
+
+                <button
+                    onClick={handleSave}
+                    className="w-full sm:w-auto bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-lg transition-all duration-300 ease-in-out shadow-lg hover:shadow-green-500/50"
+                >
+                    Finalize & Save Report
+                </button>
+            </div>
+        </div>
+      )}
+      {entryMode === 'ocr' && workflowStep === 'review' && (
+        <ImageLightboxModal 
+          src={lightboxImage} 
+          title="Scorecard Photo Preview" 
+          onClose={() => setLightboxImage(null)} 
+        />
+      )}
+      <ImageLightboxModal 
+        src={lightboxImage} 
+        title="Scorecard Photo Preview" 
+        onClose={() => setLightboxImage(null)} 
+      />
+    </div>
+  );
+};
