@@ -1,0 +1,747 @@
+
+// ... (Previous imports)
+import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { QuestionStatus, type TestReport, type QuestionLog, QuizQuestion, DailyTask, UserProfile, TestType, TestSubType, ModelInfo, AiAssistantPreferences, Flashcard } from "../types";
+import { getMarkingScheme } from "../utils/metrics";
+import { llmPipeline } from "./llm";
+import { semanticSearch } from "./vectorStore";
+
+// ... (Existing helper functions like fileToGenerativePart, encodeAudio... - NO CHANGES)
+
+export const fileToGenerativePart = async (file: File) => {
+  const base64EncodedDataPromise = new Promise<string>((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result.split(',')[1]);
+      } else {
+        resolve('');
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+  return {
+    inlineData: { data: await base64EncodedDataPromise, mimeType: file.type },
+  };
+};
+
+export function encodeAudio(bytes: Uint8Array): string {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+export function decodeAudio(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+export async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
+// ... (summarizeTestHistory, formatFullHistoryContext... - UNCHANGED)
+export const summarizeTestHistory = (reports: TestReport[]): string => {
+    if (!reports || reports.length === 0) return "No test history available.";
+    const sortedReports = [...reports].sort((a, b) => new Date(a.testDate).getTime() - new Date(b.testDate).getTime());
+    const totalTests = sortedReports.length;
+    const scoreTrace = sortedReports.map(r => r.total.marks).join(', ');
+    const totalScoreSum = sortedReports.reduce((s, r) => s + r.total.marks, 0);
+    const avgScore = (totalScoreSum / totalTests).toFixed(1);
+    const maxScore = Math.max(...sortedReports.map(r => r.total.marks));
+    const recentReports = sortedReports.slice(-3).reverse();
+    const recentDetails = recentReports.map(r => {
+        const p = r.physics.marks;
+        const c = r.chemistry.marks;
+        const m = r.maths.marks;
+        const acc = r.totalMetrics?.accuracy.toFixed(0) || 'N/A';
+        return `[${r.testDate}] ${r.testName}: Total ${r.total.marks} (P:${p}/C:${c}/M:${m}) Acc:${acc}%`;
+    }).join('\n');
+    return `
+**Test History Summary:**
+- Count: ${totalTests} tests
+- Avg: ${avgScore} | Max: ${maxScore}
+- Score Trend (Old->New): [${scoreTrace}]
+- Recent Detail (Last 3):
+${recentDetails}
+    `.trim();
+};
+
+export const formatFullHistoryContext = (reports: TestReport[], logs: QuestionLog[]): string => {
+    const sortedReports = [...reports].sort((a, b) => new Date(a.testDate).getTime() - new Date(b.testDate).getTime());
+    let context = "**FULL ACADEMIC HISTORY:**\n\n";
+    context += "**TEST REPORTS (Chronological):**\n";
+    context += sortedReports.map(r => 
+        `- ${r.testName} (${r.testDate}): Total ${r.total.marks} (Rank ${r.total.rank}) | P:${r.physics.marks} C:${r.chemistry.marks} M:${r.maths.marks}`
+    ).join('\n');
+    context += "\n\n";
+    context += "**ALL QUESTION LOGS (Format: Test:Q# | Subj | Topic | Status | Marks | Error):**\n";
+    const reportMap = new Map(reports.map(r => [r.id, r.testName]));
+    context += logs.map(l => {
+        const testName = reportMap.get(l.testId) || 'Unknown';
+        const statusShort = l.status === 'Fully Correct' ? '✅' : l.status === 'Wrong' ? '❌' : l.status === 'Partially Correct' ? '⚠️' : '⚪';
+        const subjShort = l.subject.substring(0,3).toUpperCase();
+        const error = l.reasonForError ? ` [${l.reasonForError}]` : '';
+        return `${testName}:Q${l.questionNumber} | ${subjShort} | ${l.topic} | ${statusShort} | ${l.marksAwarded}${error}`;
+    }).join('\n');
+    return context;
+};
+
+// --- UPDATED RETRIEVAL LOGIC ---
+export const retrieveRelevantContext = async (query: string, logs: QuestionLog[], apiKey: string): Promise<string> => {
+    try {
+        // 1. Try Semantic Search (Vector Store) first
+        const semanticResults = await semanticSearch(query, 10);
+        
+        if (semanticResults.length > 0) {
+            console.log(`[RAG] Found ${semanticResults.length} semantic matches for "${query}"`);
+            const contextStr = semanticResults.map(r => `- ${r.content} (Relevance: ${(r.score * 100).toFixed(0)}%)`).join('\n');
+            return `**Relevant Past Mistakes (Semantic Search):**\n${contextStr}`;
+        }
+
+        // 2. Fallback to Keyword Matching if Semantic fails (e.g., model not loaded yet)
+        console.log("[RAG] Falling back to keyword search.");
+        const lowerQuery = query.toLowerCase();
+        let relevantLogs = logs;
+        
+        // Basic filtering
+        if (lowerQuery.includes('physics')) relevantLogs = logs.filter(l => l.subject === 'physics');
+        else if (lowerQuery.includes('chemistry')) relevantLogs = logs.filter(l => l.subject === 'chemistry');
+        else if (lowerQuery.includes('math')) relevantLogs = logs.filter(l => l.subject === 'maths');
+        
+        const keywords = lowerQuery.split(/[\s,?.!]+/).filter(w => w.length > 3 && !['what','when','where','which','this','that','explain','analyze'].includes(w));
+        
+        if (keywords.length > 0) {
+            const keywordMatches = relevantLogs.filter(l => {
+                const content = `${l.topic} ${l.reasonForError || ''}`.toLowerCase();
+                return keywords.some(k => content.includes(k));
+            });
+            if (keywordMatches.length > 0) {
+                relevantLogs = keywordMatches;
+            }
+        }
+        
+        const errors = relevantLogs.filter(l => l.status === QuestionStatus.Wrong || l.status === QuestionStatus.PartiallyCorrect);
+        const set = errors.length > 0 ? errors : relevantLogs;
+        const finalSet = set.slice(-15);
+        
+        if (finalSet.length === 0) return "";
+        return `**Relevant Question Logs (Keyword Match):**\n${finalSet.map(l => `- [${l.subject}] ${l.topic}: ${l.status} (${l.reasonForError || 'No Reason'})`).join('\n')}`;
+        
+    } catch (e) {
+        console.error("Context retrieval failed:", e);
+        return "";
+    }
+};
+
+const getMockPrefs = (apiKey: string, modelName?: string): AiAssistantPreferences => {
+    try {
+        const stored = localStorage.getItem('aiAssistantPreferences_v1');
+        if (stored) {
+            const prefs = JSON.parse(stored);
+            if (modelName) prefs.model = modelName;
+            return prefs;
+        }
+    } catch {}
+    return { model: modelName || 'gemini-3.8-flash', responseLength: 'medium', tone: 'neutral' };
+}
+
+// ... (Other exports: validateOCRData, inferTestMetadata, getAIAnalysis, generateStudyPlan...)
+export const validateOCRData = async (report: Partial<TestReport>, logs: Partial<QuestionLog>[], apiKey: string): Promise<string[]> => {
+    const prompt = `Perform a sanity check on JEE test data. Report: ${JSON.stringify(report)}. Logs count: ${logs.length}. Check for mark mismatches and logic errors. Return JSON with 'warnings' array of strings.`;
+    try {
+        const res = await llmPipeline({ task: 'technical_ops', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+        return JSON.parse(res).warnings || [];
+    } catch { return []; }
+};
+
+export const inferTestMetadata = async (testName: string, apiKey: string): Promise<{ type: TestType, subType: TestSubType }> => {
+    const prompt = `Infer JEE Test Type/SubType from name "${testName}". Return JSON {type: string, subType: string}.`;
+    try {
+        const res = await llmPipeline({ task: 'technical_ops', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+        const json = JSON.parse(res);
+        return { type: json.type as TestType || TestType.ChapterTest, subType: json.subType as TestSubType || TestSubType.JEEMains };
+    } catch { return { type: TestType.ChapterTest, subType: TestSubType.JEEMains }; }
+};
+
+export const getAIAnalysis = async (reports: TestReport[], logs: QuestionLog[], apiKey: string, modelName?: string): Promise<string> => {
+    const historySummary = summarizeTestHistory(reports);
+    const prompt = `Analyze this JEE student performance. ${historySummary} Weak Topics Sample: ${JSON.stringify(logs.slice(-20))}. Provide comprehensive Markdown report with strategy.`;
+    return await llmPipeline({ task: 'analysis_deep', prompt, userPreferences: getMockPrefs(apiKey, modelName), googleApiKey: apiKey, includeFooter: true });
+};
+
+export const generateStudyPlan = async (reports: TestReport[], logs: QuestionLog[], apiKey: string, modelName?: string): Promise<string> => {
+    try {
+        const historySummary = summarizeTestHistory(reports);
+        const prompt = `Create a 7-day JEE study plan based on this data. Output Markdown. ${historySummary}`;
+        return await llmPipeline({ task: 'planning_routine', prompt, userPreferences: getMockPrefs(apiKey, modelName), googleApiKey: apiKey, includeFooter: true });
+    } catch {
+        return "### 7-Day Study Plan\n- Day 1: Physics high-yield problem solving\n- Day 2: Chemistry formula and reaction review\n- Day 3: Mathematics core calculus drills\n- Day 4: Full-length mock analysis\n- Day 5: Error log triage & flashcards\n- Day 6: Weak chapter targeted problem sets\n- Day 7: Timed test and revision recap";
+    }
+};
+
+export const generateContextualInsight = async (promptData: string, apiKey: string): Promise<string> => {
+    try {
+        return await llmPipeline({ task: 'chat_general', prompt: `Analyze data and give 1 sentence insight: ${promptData}`, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+    } catch {
+        return "Keep analyzing error patterns to turn weak spots into strengths.";
+    }
+};
+
+export const generateDashboardInsight = async (reports: TestReport[], apiKey: string): Promise<string> => {
+    try {
+        const historySummary = summarizeTestHistory(reports);
+        return await llmPipeline({ task: 'creative_writing', prompt: `Review this performance data: ${historySummary}. Give 1 motivating sentence.`, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+    } catch {
+        return "Steady focus and deliberate daily practice pave the road to rank mastery.";
+    }
+};
+
+export const generateChartAnalysis = async (chartTitle: string, dataSummary: string, apiKey: string): Promise<string> => {
+    try {
+        return await llmPipeline({ task: 'analysis_deep', prompt: `Analyze chart "${chartTitle}": ${dataSummary}. 1 sentence summary.`, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+    } catch {
+        return `Chart showing ${chartTitle.toLowerCase()} across recent performance metrics.`;
+    }
+};
+
+export const getDailyQuote = async (apiKey: string): Promise<string> => {
+    try {
+        return await llmPipeline({ task: 'creative_writing', prompt: "Give me a short, powerful motivation quote for a student. No author name.", userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+    } catch {
+        return "Discipline is the bridge between goals and accomplishment.";
+    }
+};
+
+export const generateChecklistFromPlan = async (weakTopics: string[], apiKey: string): Promise<string[]> => {
+    const prompt = `Create 5 checklist items for these weak topics: ${weakTopics.join(', ')}. Return JSON { checklist: string[] }`;
+    try {
+        const res = await llmPipeline({ task: 'planning_routine', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+        return JSON.parse(res).checklist || [];
+    } catch { return ["Review notes", "Solve problems"]; }
+};
+
+export const generateEndOfDaySummary = async (goals: any[], checklist: any[], apiKey: string): Promise<string> => {
+    try {
+        return await llmPipeline({ task: 'creative_writing', prompt: `Summarize my study day. Goals: ${JSON.stringify(goals)}. Checklist: ${JSON.stringify(checklist)}. Be encouraging.`, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+    } catch {
+        return "Great effort put in today! Consistent daily review compounds into true exam mastery.";
+    }
+};
+
+export const generateTestAnalysis = async (report: TestReport, apiKey: string, model?: string): Promise<string> => {
+    const prompt = `Act as an elite JEE academic strategist and performance psychologist. 
+    Analyze this test report: ${JSON.stringify(report)}.
+    
+    Provide a deep-dive analysis in Markdown format with the following structure to ensure beautiful rendering:
+    
+    # 📊 Performance Deep-Dive: ${report.testName}
+    
+    ## 🎯 Executive Summary
+    Provide a high-level overview of the performance. 
+    - **Total Marks**: ${report.total.marks}
+    - **Rank**: ${report.total.rank}
+    - **Overall Accuracy**: ${report.totalMetrics?.accuracy.toFixed(1)}%
+    
+    > **Strategic Insight**: Provide a high-impact, psychological or strategic observation here using a blockquote.
+    
+    ## 🧬 Subject-Wise Breakdown
+    | Subject | Marks | Accuracy | Status |
+    | :--- | :--- | :--- | :--- |
+    | Physics | ${report.physics.marks} | ${(report.physics.correct / (report.physics.correct + report.physics.wrong) * 100 || 0).toFixed(1)}% | ${report.physics.marks > 50 ? 'Strong' : 'Needs Work'} |
+    | Chemistry | ${report.chemistry.marks} | ${(report.chemistry.correct / (report.chemistry.correct + report.chemistry.wrong) * 100 || 0).toFixed(1)}% | ${report.chemistry.marks > 50 ? 'Strong' : 'Needs Work'} |
+    | Maths | ${report.maths.marks} | ${(report.maths.correct / (report.maths.correct + report.maths.wrong) * 100 || 0).toFixed(1)}% | ${report.maths.marks > 50 ? 'Strong' : 'Needs Work'} |
+    
+    Detailed insights into Physics, Chemistry, and Maths performance. Highlight where the student excelled and where they struggled.
+    
+    ## 🧠 Behavioral Patterns & SPAQ Analysis
+    Analyze metrics like Accuracy, Attempt Rate, and SPAQ to identify psychological or behavioral hurdles.
+    - **Pattern 1**: Describe a specific behavior (e.g., "Over-attempting in Physics").
+    - **Pattern 2**: Describe another behavior (e.g., "Time management in Maths").
+    
+    ## 💉 The "Vaccination" Action Plan
+    3-5 highly specific, actionable steps the student must take in the next 48 hours to fix the most critical leaks.
+    1. **Step 1**: Specific topic and action.
+    2. **Step 2**: Specific topic and action.
+    3. **Step 3**: Specific topic and action.
+    
+    Use a professional, encouraging, yet firm tone. Use bolding and lists for readability.`;
+    return await llmPipeline({ task: 'analysis_deep', prompt, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+};
+
+export const generateAudioDebrief = async (report: TestReport, apiKey: string): Promise<string | null> => {
+    const ai = new GoogleGenAI({ apiKey });
+    const prompt = `
+    You are an encouraging but firm JEE mentor. Provide a 60-second audio debrief for the student based on this test report.
+    Speak directly to the student (e.g., "Hey there, looking at your recent test...").
+    Highlight their total score, their best subject, and the subject that needs the most work.
+    Give them one specific piece of advice to reduce negative marking or improve accuracy.
+    Keep it conversational, motivational, and concise.
+
+    Test Name: ${report.testName}
+    Total Marks: ${report.total.marks}
+    Physics: ${report.physics.marks} marks
+    Chemistry: ${report.chemistry.marks} marks
+    Maths: ${report.maths.marks} marks
+    Accuracy: ${report.totalMetrics?.accuracy.toFixed(1)}%
+    `;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash-preview-tts",
+            contents: [{ parts: [{ text: prompt }] }],
+            config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: 'Puck' },
+                    },
+                },
+            },
+        });
+        
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        return base64Audio || null;
+    } catch (error) {
+        console.error("Error generating audio debrief:", error);
+        return null;
+    }
+};
+
+export const generateVaccinePlan = async (logs: QuestionLog[], apiKey: string, model?: string): Promise<string> => {
+    const prompt = `Act as a Master JEE Coach. You are designing a "7-Day Error Vaccination Plan" for a student based on their recent mistakes.
+    
+    DATA (Question Logs): ${JSON.stringify(logs.slice(0, 50))}
+    
+    Your goal is to "vaccinate" the student against repeating these errors. 
+    Provide a structured 7-day plan in Markdown:
+    - **Day 1-2: Root Cause Eradication**: Focus on the most frequent error reasons (e.g., "Conceptual Gap in Electromagnetics").
+    - **Day 3-4: Behavioral Calibration**: Exercises to fix "Silly Mistakes" or "Time Management" issues.
+    - **Day 5-6: Targeted Drill**: Specific types of questions or topics to practice.
+    - **Day 7: Simulation & Review**: How to test if the "vaccine" worked.
+    
+    Include specific "Dos and Don'ts" for each day. Be highly specific to the topics and errors found in the logs.`;
+    return await llmPipeline({ task: 'planning_routine', prompt, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+};
+
+export const getAIChiefAnalystSummary = async (weakTopics: any, errorReasons: any, correlations: any, apiKey: string, improvise: boolean, model?: string): Promise<string> => {
+    const prompt = `Act as the Chief Academic Analyst for an elite JEE coaching institute. 
+    Analyze the following performance data:
+    - **Weak Topics**: ${JSON.stringify(weakTopics)}
+    - **Error Reasons**: ${JSON.stringify(errorReasons)}
+    
+    ${improvise 
+        ? "Provide a counter-intuitive, 'black-swan' insight. Don't just state the obvious. Find a hidden correlation or a non-obvious strategy that could lead to a breakthrough." 
+        : "Provide a high-level executive summary. Identify the single biggest 'bottleneck' holding the student back and suggest a high-impact strategic shift."}
+    
+    Format the output in Markdown. Be concise but profound.`;
+    return await llmPipeline({ task: 'analysis_briefing', prompt, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey, includeFooter: true });
+};
+
+export const generateFocusedStudyPlan = async (subject: string, weakTopics: string[], apiKey: string, model?: string): Promise<string> => {
+    return await llmPipeline({ task: 'planning_routine', prompt: `Create 3-day recovery plan for ${subject}. Weakness: ${weakTopics.join(', ')}. Markdown format.`, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey, includeFooter: true });
+};
+
+export const explainTopic = async (topic: string, apiKey: string, complexity: 'standard'|'simple', model?: string): Promise<string> => {
+    return await llmPipeline({ task: 'stem_core', prompt: `Explain '${topic}' for JEE student. Complexity: ${complexity}. Markdown.`, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey, includeFooter: true });
+};
+
+export const generateGatekeeperQuiz = async (topic: string, apiKey: string, model?: string): Promise<QuizQuestion[]> => {
+    const prompt = `Generate 3 conceptual MCQ for '${topic}' JEE level. Return JSON { quiz: [{question, options:{A,B,C,D}, answer: "A", explanation}] }`;
+    try {
+        const res = await llmPipeline({ task: 'stem_core', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).quiz || [];
+    } catch { return []; }
+};
+
+export const generateTasksFromGoal = async (goalText: string, apiKey: string, model?: string): Promise<{ task: string, time: number }[]> => {
+    const prompt = `Break goal '${goalText}' into 3 tasks with time. Return JSON { tasks: [{task, time}] }`;
+    try {
+        const res = await llmPipeline({ task: 'planning_routine', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).tasks || [];
+    } catch { return []; }
+};
+
+export const generateSmartTasks = async (weakTopics: string[], bioStats: { sleep: number; stress: number; energy: number } | null, apiKey: string, model?: string): Promise<{ task: string; time: number; topic: string; }[]> => {
+    const bioContext = bioStats ? `User energy: ${bioStats.energy}/10, stress: ${bioStats.stress}/10, sleep: ${bioStats.sleep}h. Adjust task difficulty and duration accordingly.` : '';
+    const prompt = `Suggest 3 tasks for weak topics: ${weakTopics.join(', ')}. ${bioContext} Return JSON { tasks: [{task, time, topic}] }`;
+    try {
+        const res = await llmPipeline({ task: 'planning_routine', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).tasks || [];
+    } catch { return []; }
+};
+
+export const generateSmartTaskOrder = async (tasks: DailyTask[], userProfile: UserProfile, logs: QuestionLog[], bioStats: { sleep: number; stress: number; energy: number } | null, apiKey: string, model?: string): Promise<string[]> => {
+    const bioContext = bioStats ? `User energy: ${bioStats.energy}/10, stress: ${bioStats.stress}/10, sleep: ${bioStats.sleep}h.` : '';
+    const prompt = `Reorder tasks for max efficiency. ${bioContext} Profile: ${JSON.stringify(userProfile.studyTimes)}. Tasks: ${JSON.stringify(tasks)}. Return JSON { orderedIds: string[] }`;
+    try {
+        const res = await llmPipeline({ task: 'planning_sorting', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).orderedIds || tasks.map(t => t.id);
+    } catch { return tasks.map(t => t.id); }
+};
+
+export const generateLearningPath = async (topic: string, weaknesses: string[], apiKey: string, model?: string): Promise<{ task: string; time: number; topic: string; }[]> => {
+    const prompt = `Create learning path for '${topic}'. Weak prerequisites: ${weaknesses.join(', ')}. Return JSON { path: [{task, time, topic}] }`;
+    try {
+        const res = await llmPipeline({ task: 'planning_routine', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).path || [];
+    } catch { return []; }
+};
+
+export const generateNextWhy = async (context: string, prevAnswer: string, step: number, apiKey: string, model?: string): Promise<{ question: string; isFinal: boolean; solution?: string }> => {
+    const prompt = `Socratic 5 Whys. Context: ${context}. Prev: ${prevAnswer}. Step ${step}/5. Return JSON { question, isFinal, solution? }`;
+    try {
+        const res = await llmPipeline({ task: 'analysis_root_cause', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res);
+    } catch { return { question: "Why?", isFinal: false }; }
+};
+
+export const generatePreMortem = async (topic: string, prereqs: string[], errors: string[], apiKey: string, model?: string): Promise<string> => {
+    return await llmPipeline({ task: 'analysis_deep', prompt: `Pre-mortem for '${topic}'. Prereq errors: ${errors.join('; ')}. Predict hurdles.`, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey, includeFooter: true });
+};
+
+export const generateOracleDrill = async (errorStats: { topic: string; reason: string; count: number }[], apiKey: string, model?: string): Promise<QuizQuestion[]> => {
+    const topWeaknesses = errorStats.slice(0, 3);
+    const topicsContext = topWeaknesses.map(w => `${w.topic} (Failure Pattern: ${w.reason})`).join(', ');
+    const prompt = `Generate a 'Predictive Drill' of 5 JEE Advanced level Multiple Choice Questions. Focus specifically on these student weaknesses: ${topicsContext}. Design questions that trap the student into making the specific errors listed. Return strictly JSON: { "quiz": [ { "question": "", "options": {"A":"", "B":""...}, "answer": "A", "explanation": "" } ] }`;
+    try {
+        const res = await llmPipeline({ task: 'stem_core', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        return JSON.parse(res).quiz || [];
+    } catch (e) { console.error("Oracle Generation Failed", e); return []; }
+};
+
+export const analyzeReflection = async (content: string, apiKey: string): Promise<{ tags: string[], summary: string, actionItems: string[], relatedTopics: string[], mood: 'eureka' | 'frustrated' | 'neutral' | 'confident' | 'confused' }> => {
+    const prompt = `Analyze this student's study reflection/journal entry: "${content}". 
+    Return a JSON object with:
+    - tags: array of strings (e.g., subjects, topics, or themes like 'time-management', 'silly-mistake')
+    - summary: a 1-sentence key takeaway
+    - actionItems: array of strings (actionable steps derived from the reflection)
+    - relatedTopics: array of strings (JEE topics mentioned or implied)
+    - mood: one of 'eureka', 'frustrated', 'neutral', 'confident', 'confused'`;
+    try {
+        const res = await llmPipeline({ task: 'analysis_deep', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey), googleApiKey: apiKey });
+        const parsed = JSON.parse(res);
+        return {
+            tags: parsed.tags || [],
+            summary: parsed.summary || "Could not generate summary.",
+            actionItems: parsed.actionItems || [],
+            relatedTopics: parsed.relatedTopics || [],
+            mood: parsed.mood || 'neutral'
+        };
+    } catch {
+        return { tags: [], summary: "Could not analyze.", actionItems: [], relatedTopics: [], mood: 'neutral' };
+    }
+};
+
+export const generateFlashcards = async (topics: string[], apiKey: string, model?: string): Promise<Flashcard[]> => {
+    const prompt = `Generate 3 conceptual JEE flashcards for: ${topics.join(', ')}. Return JSON array: [ { "topic": "", "front": "", "back": "", "difficulty": "Medium" } ]`;
+    try {
+        const res = await llmPipeline({ task: 'flashcard_gen', prompt, expectJson: true, userPreferences: getMockPrefs(apiKey, model), googleApiKey: apiKey });
+        const parsed = JSON.parse(res);
+        return (parsed.flashcards || parsed || []).map((card: any, index: number) => ({
+            id: `fc-${Date.now()}-${index}`,
+            topic: card.topic,
+            front: card.front,
+            back: card.back,
+            difficulty: card.difficulty,
+            nextReview: new Date().toISOString(),
+            interval: 0,
+            easeFactor: 2.5,
+            reviews: 0
+        }));
+    } catch (e) {
+        console.error("Flashcard generation failed", e);
+        throw new Error("Failed to generate flashcards.");
+    }
+};
+
+
+
+// ... (Rest of file including generateCardSolution and exports remains unchanged)
+export const generateCardSolution = async (
+    cardContext: { 
+        topic: string; 
+        front: string; 
+        chapter?: string; 
+        subject?: string; 
+        testName?: string; 
+        difficulty?: string; 
+        errorCode?: string 
+    }, 
+    apiKey: string, 
+    model?: string
+): Promise<{ solution: string; mutation?: any; visual_aid?: any; keyFormula?: string; mnemonic?: string; prerequisite?: string }> => {
+    const prompt = `
+    A JEE student made a mistake in an exam.
+    **Subject:** ${cardContext.subject || 'N/A'}
+    **Chapter:** ${cardContext.chapter || 'N/A'}
+    **Topic:** ${cardContext.topic}
+    **Error Code:** ${cardContext.errorCode || 'N/A'}
+    **Difficulty:** ${cardContext.difficulty || 'N/A'}
+    **Context:** ${cardContext.front}
+    
+    You are an expert JEE Physics, Chemistry, and Mathematics Tutor.
+    
+    TASK 1: Provide a "Solution Protocol" (Markdown).
+    - Explain the core concept they likely missed.
+    - Provide the correct mental model or formula with LaTeX ($...$ or $$...$$).
+    - Give a "Rule of Thumb" to avoid this mistake next time.
+    
+    TASK 2: Generate "keyFormula" (LaTeX formula string) and "mnemonic" (short memory hook or tip).
+
+    TASK 3: Generate a "Viral Mutation" - a new, short conceptual or numerical question testing the SAME logic.
+    
+    TASK 4: **MULTIMODAL CHECK**: Does this concept (Mechanics, Optics, Geometry, Circuits, Graphs) require a visual? 
+    If yes, provide a 'visual_aid' object with 'svg' (clean standalone SVG code) and 'description'.
+    If no, set 'visual_aid' to null.
+    
+    RETURN JSON:
+    {
+      "solution": "Markdown string...",
+      "keyFormula": "I = I_{cm} + md^2",
+      "mnemonic": "PAT: Parallel Axis Theorem applies when axes are parallel",
+      "prerequisite": "Center of Mass location",
+      "mutation": {
+        "question": "If velocity is doubled...",
+        "answer": "Kinetic energy becomes 4x",
+        "options": {"A": "...", "B": "..."}
+      },
+      "visual_aid": {
+        "svg": "<svg viewBox='0 0 100 100'>...</svg>",
+        "description": "Diagram showing..."
+      }
+    }
+    `;
+
+    try {
+        const resultText = await llmPipeline({
+            task: 'flashcard_gen', 
+            prompt,
+            expectJson: true,
+            userPreferences: getMockPrefs(apiKey, model),
+            googleApiKey: apiKey
+        });
+        
+        return JSON.parse(resultText);
+    } catch (e) {
+        console.warn("JSON Parse failed for vaccine synthesis, falling back to text.", e);
+        const fallbackText = await llmPipeline({
+             task: 'flashcard_gen',
+             prompt: `Explain solution for ${cardContext.front} in Markdown.`,
+             userPreferences: getMockPrefs(apiKey, model),
+             googleApiKey: apiKey
+        });
+        return { solution: fallbackText };
+    }
+};
+
+export const enhanceCardWithAI = async (
+    card: Flashcard,
+    apiKey: string,
+    model?: string
+): Promise<{ keyFormula?: string; mnemonic?: string; mutation?: any }> => {
+    const prompt = `
+    A JEE student is studying a flashcard for topic "${card.topic}".
+    
+    **Question / Context:**
+    ${card.questionHtml || card.front}
+    
+    **Explanation / Solution:**
+    ${card.explanationHtml || card.back}
+    
+    You are an expert JEE Coach. Provide AI enhancement for this flashcard:
+    1. "keyFormula": The single most important formula or definition (in LaTeX).
+    2. "mnemonic": A short, catchy memory hook or rule-of-thumb (1-2 sentences).
+    3. "mutation": A short practice question variant to test understanding.
+    
+    RETURN JSON:
+    {
+      "keyFormula": "E = h \\nu",
+      "mnemonic": "Higher frequency means higher photon energy.",
+      "mutation": {
+        "question": "What happens to photon energy if wavelength is halved?",
+        "answer": "Energy doubles."
+      }
+    }
+    `;
+
+    try {
+        const resultText = await llmPipeline({
+            task: 'flashcard_gen',
+            prompt,
+            expectJson: true,
+            userPreferences: getMockPrefs(apiKey, model),
+            googleApiKey: apiKey
+        });
+        return JSON.parse(resultText);
+    } catch (e) {
+        console.error("AI card enhancement failed:", e);
+        return {};
+    }
+};
+
+export const GENUI_TOOLS = [
+    {
+        name: "renderChart", description: "Renders a visual chart in the chat.",
+        parameters: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, chartType: { type: Type.STRING, enum: ["bar", "line", "pie"] }, data: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, value: { type: Type.NUMBER }, label: { type: Type.STRING } } } }, xAxisLabel: { type: Type.STRING } }, required: ["title", "chartType", "data"] }
+    },
+    {
+        name: "createActionPlan", description: "Creates an interactive checklist.",
+        parameters: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, items: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { task: { type: Type.STRING }, priority: { type: Type.STRING, enum: ["High", "Medium", "Low"] } } } } }, required: ["title", "items"] }
+    },
+    {
+        name: "renderDiagram", description: "Generates SVG diagram code.",
+        parameters: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, svgContent: { type: Type.STRING }, description: { type: Type.STRING } }, required: ["title", "svgContent"] }
+    },
+    {
+        name: "createMindMap", description: "Creates hierarchical mind map.",
+        parameters: { type: Type.OBJECT, properties: { root: { type: Type.OBJECT, properties: { label: { type: Type.STRING }, children: { type: Type.ARRAY, items: { type: Type.OBJECT } } }, required: ["label"] } }, required: ["root"] }
+    }
+];
+
+export const getAvailableModels = async (apiKey: string): Promise<ModelInfo[]> => {
+    return [
+        { id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash', description: 'Next-Gen Flagship Multimodal & Hybrid Reasoning (Latest)' },
+        { id: 'gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash Lite', description: '500 RPD | High Efficiency Vision' },
+        { id: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash', description: 'Advanced Vision & Reasoning' },
+        { id: 'gemini-3.7-flash', displayName: 'Gemini 3.7 Flash', description: 'Flagship Multimodal & Hybrid Reasoning' },
+        { id: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash', description: 'Cutting-Edge Multimodal' },
+        { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', description: 'Deep Multimodal Reasoning' },
+        { id: 'gemma-4-26b', displayName: 'Gemma 4 26B', description: '14.4k RPD High Quota' }
+    ];
+};
+
+export const extractDataFromImage = async (
+    scoreSheetFile: File,
+    apiKey: string,
+    modelName: string = "gemini-3.8-flash", 
+    instructionSheetFile?: File,
+    useStrictPrompt: boolean = true
+): Promise<{ report: Partial<TestReport>, questions: Partial<QuestionLog>[], confidence: Record<string, 'high'|'medium'|'low'> }> => {
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const scoreSheetPart = await fileToGenerativePart(scoreSheetFile);
+    const parts: any[] = [scoreSheetPart];
+    
+    if (instructionSheetFile) {
+        const instructionPart = await fileToGenerativePart(instructionSheetFile);
+        parts.push(instructionPart);
+    }
+
+    const strictInstructions = `
+    **STRICT LAYOUT & PATTERN MATCHING INSTRUCTIONS:**
+    **1. HEADER & SUMMARY (STEP 2):**
+       - **TEST NAME**: Look specifically at the 4th row or the main header for "TEST". Extract the code (e.g., "WTA-22", "CTA-15", "WTA-05").
+       - **DATE**: Look for the date in the header section. Format as YYYY-MM-DD.
+       - **MARKS & RANK**: Look at the top-right summary table.
+         - Columns usually are: Subject | Marks | % | Rank.
+         - **CRITICAL**: Ignore the '%' or 'Percentage' column. Look for 'MARKS' which are INTEGERS (e.g. 42, 25, 8). Do NOT pick decimals like 13.33.
+         - Extract Marks and Ranks for Maths, Physics, Chemistry, and Total.
+       - **LOGIC FOR TYPE/SUBTYPE**:
+         - If Name contains "CTA" -> type = "Part Test"
+         - If Name contains "WTA" -> type = "Chapter Test"
+         - If Name contains "Full" or "Mock" -> type = "Full Syllabus Mock"
+         - Count the total questions in the grid below.
+           - If Total Questions < 75 -> subType = "JEE Advanced"
+           - If Total Questions >= 75 -> subType = "JEE Mains"
+    **2. QUESTION GRID (STEP 3) - DO NOT CHANGE LOGIC:**
+       - If an Instruction Sheet is provided, look at columns: "Section Name" | "Question Type" | "+Ve Marks" | "-Ve Marks".
+       - Construct \`questionType\` EXACTLY as: \`[Standard Name] (+[Pos], [Neg])\`.
+       - Standard Names: "Single Correct", "Multiple Correct", "Integer", "Matrix Match".
+       - Example: If instructions say "Sec-I: Single Correct, +3, -1", then for every Q in Sec-I, \`questionType\` is "Single Correct (+3, -1)".
+       - Also populate \`positiveMarks\`=3 and \`negativeMarks\`=-1.
+       - **STATUS**: Map 'U'/- -> 'Unanswered', 'W' -> 'Wrong', 'C'/'R' -> 'Fully Correct'.
+    `;
+
+    const flexibleInstructions = `
+    **DYNAMIC GENERALIST OCR INSTRUCTIONS:**
+    - Read and extract all visible test data from the image dynamically without assuming rigid table column positions or fixed naming schemes.
+    - Extract the test name, test date, subject marks (Physics, Chemistry, Maths, Total), ranks, and individual question statuses (Fully Correct, Wrong, Unanswered, Partially Correct).
+    - Automatically infer test type (Part Test, Chapter Test, Full Syllabus Mock) and subType (JEE Advanced, JEE Mains) based on the overall content and question count.
+    `;
+
+    const prompt = `
+    You are an expert OCR system for Academic Test Reports. Your task is to extract data and fill in the blanks using single pass logic.
+    ${useStrictPrompt ? strictInstructions : flexibleInstructions}
+
+    **RETURN JSON:**
+    {
+      "testName": "string",
+      "testDate": "YYYY-MM-DD",
+      "type": "Part Test" | "Chapter Test" | "Full Syllabus Mock",
+      "subType": "JEE Advanced" | "JEE Mains",
+      "physics": { "marks": number, "rank": number, "correct": number, "wrong": number, "unanswered": number, "partial": number },
+      "chemistry": { "marks": number, "rank": number, "correct": number, "wrong": number, "unanswered": number, "partial": number },
+      "maths": { "marks": number, "rank": number, "correct": number, "wrong": number, "unanswered": number, "partial": number },
+      "total": { "marks": number, "rank": number, "correct": number, "wrong": number, "unanswered": number, "partial": number },
+      "questions": [
+        {
+          "questionNumber": number,
+          "subject": "physics" | "chemistry" | "maths",
+          "status": "Fully Correct" | "Wrong" | "Unanswered" | "Partially Correct",
+          "questionType": "string (e.g. Single Correct (+3, -1))",
+          "positiveMarks": number,
+          "negativeMarks": number,
+          "marksAwarded": number
+        }
+      ]
+    }
+    `;
+    parts.push({ text: prompt });
+
+    // Fallback chain: gemini-3.8-flash -> gemini-3.5-flash-lite -> gemini-3.5-flash -> gemini-3.7-flash -> gemini-3.6-flash
+    const fallbackChain = [modelName, 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.6-flash']
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    let lastErr: any = null;
+
+    for (const targetModel of fallbackChain) {
+      try {
+        console.debug(`[OCR Vision] Attempting extraction with ${targetModel}...`);
+        const response = await ai.models.generateContent({
+            model: targetModel, 
+            contents: { parts: parts },
+            config: {
+                responseMimeType: "application/json",
+            },
+        });
+
+        const jsonText = response.text?.trim() || "";
+        const parsedJson = JSON.parse(jsonText);
+        return { report: parsedJson || {}, questions: parsedJson.questions || [], confidence: { physics: 'high', chemistry: 'high', maths: 'high', total: 'high' } };
+      } catch (err: any) {
+        lastErr = err;
+        console.warn(`[OCR Vision] ${targetModel} failed:`, err?.message || err);
+        // Continue to fallback model
+      }
+    }
+
+    throw lastErr || new Error(`All vision model attempts failed.`);
+  } catch (error) {
+    console.error("Error extracting data:", error);
+    throw new Error(`Failed to process image. API Key or Model might be invalid.`);
+  }
+};
