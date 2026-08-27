@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="50%" stop-color="#020617" />
+      <stop offset="100%" stop-color="#090d16" />
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a855f7" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background Rounded Shield -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)" stroke="#334155" stroke-width="8"/>
+
+  <!-- Glowing Ambient Orb -->
+  <circle cx="256" cy="256" r="140" fill="#06b6d4" opacity="0.15" filter="url(#glow)"/>
+
+  <!-- Stylized Analytics Matrix & Graduation Cap Icon -->
+  <g transform="translate(106, 106) scale(0.58)">
+    <!-- Shield / Core Base -->
+    <path d="M256 32L64 128v144c0 148.6 82.2 256.2 192 288 109.8-31.8 192-139.4 192-288V128L256 32z" 
+          fill="none" stroke="url(#cyanGrad)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" />
+    
+    <!-- Pulse Line / Velocity Growth -->
+    <path d="M128 288h64l48-80 64 160 48-80h64" 
+          fill="none" stroke="url(#purpleGrad)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+    
+    <!-- Core Nodes -->
+    <circle cx="240" cy="208" r="14" fill="#38bdf8" />
+    <circle cx="304" cy="368" r="14" fill="#a855f7" />
+    <circle cx="256" cy="140" r="18" fill="#38bdf8" filter="url(#glow)"/>
+  </g>
+</svg>
