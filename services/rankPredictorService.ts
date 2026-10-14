@@ -356,4 +356,3 @@ export function getHistoricalTrajectory(college: CollegeMatch): HistoricalTrajec
         sourceCount: points.length
     };
 }
-
