@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+npm-debug.log*
+
+# Production Build Output
+dist/
+dist-ssr/
+build/
+
+# Environment & Secrets (Permanent Shield)
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Local Logs & Scratches
+*.log
+audit_shots/
+Extra/
+Extras/
+graphify-out/
+scripts/
+*.cjs
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
